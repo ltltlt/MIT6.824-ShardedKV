@@ -7,7 +7,10 @@ package mr
 //
 
 import (
+	"log"
 	"os"
+	"sync/atomic"
+	"time"
 )
 import "strconv"
 
@@ -15,6 +18,12 @@ import "strconv"
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
+
+const (
+	Mapper = iota + 1
+	Reducer
+	Complete
+)
 
 type ExampleArgs struct {
 	X int
@@ -28,45 +37,55 @@ type GetTaskArgs struct {
 }
 
 type GetTaskReply struct {
-	IsMapper bool
+	TaskKind int
 	FileName string
+	NMapper  int
 	NReduce  int
 	TaskId   int
 
-	IsDoneTask bool
+	ReduceTaskNo int
 }
 
-func newMapperTask(mapTaskId int, fileName string, nReduce int) *GetTaskReply {
+func newMapperTask(taskId int, fileName string, nReduce int) *GetTaskReply {
 	return &GetTaskReply{
-		IsMapper: true,
+		TaskKind: Mapper,
 		FileName: fileName,
 		NReduce:  nReduce,
-		TaskId:   mapTaskId,
+		TaskId:   taskId,
 	}
 }
 
-func newReducerTask(reduceTaskId int) *GetTaskReply {
+func newReducerTask(taskId int, reduceTaskNo int) *GetTaskReply {
 	return &GetTaskReply{
-		IsMapper: false,
-		TaskId:   reduceTaskId,
+		TaskKind:     Reducer,
+		TaskId:       taskId,
+		ReduceTaskNo: reduceTaskNo,
 	}
 }
 
-var doneTask *GetTaskReply = &GetTaskReply{
-	IsDoneTask: true,
+var doneTaskReply = GetTaskReply{
+	TaskKind: Complete,
 }
-
-type Dummy struct{}
 
 // Add your RPC definitions here.
-func (c *Coordinator) GetTask(dummy *GetTaskArgs, task *GetTaskReply) error {
-	var reply = <-c.TaskChan
-	*task = *reply
+func (c *Coordinator) GetTask(dummy *GetTaskArgs, reply *GetTaskReply) error {
+	var task = <-c.TaskChan
+	*reply = *task
+	time.AfterFunc(time.Second*10, func() {
+		c.RLock()
+		isDone := c.DoneTasks[task.TaskId]
+		c.RUnlock()
+		if !isDone {
+			log.Printf("Task is lost, regenerate, kind: %v, task id: %v, reducerid: %v\n",
+				task.TaskKind, task.TaskId, task.ReduceTaskNo)
+			c.TaskChan <- task
+		}
+	})
 	return nil
 }
 
 type TaskDoneArgs struct {
-	IsMapper bool
+	TaskKind int
 	TaskId   int
 }
 
@@ -74,7 +93,21 @@ type TaskDoneReply struct {
 }
 
 func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
-
+	log.Printf("Receive task done, %+v\n", args)
+	c.Lock()
+	old := c.DoneTasks[args.TaskId]
+	c.DoneTasks[args.TaskId] = true
+	c.Unlock()
+	if !old {
+		if args.TaskKind == Mapper {
+			atomic.AddInt32(&c.WorkingMapper, -1)
+		} else if args.TaskKind == Reducer {
+			atomic.AddInt32(&c.WorkingReducer, -1)
+		}
+	} else {
+		log.Printf("Receive duplicate task done request, ignore...")
+	}
+	return nil
 }
 
 // Cook up a unique-ish UNIX-domain socket name

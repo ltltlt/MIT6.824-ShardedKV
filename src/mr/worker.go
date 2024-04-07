@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
+	"path/filepath"
+	"sort"
+	"strings"
 )
 import "log"
 import "net/rpc"
@@ -15,6 +17,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -29,24 +38,30 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	log.SetPrefix("Worker ")
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-	reply := GetTaskReply{}
 	for true {
+		// Attention: we cannot reuse struct, because golang won't pass zero value
+		// when server reply a:0, the server won't send it back to client,
+		// which means if the current value of reply is 1, it won't be overwrite to 0
+		reply := GetTaskReply{}
 		ok := call("Coordinator.GetTask", &GetTaskArgs{}, &reply)
-		if !ok || reply.IsDoneTask {
+		if ok {
+			log.Printf("Got task assignment: %+v", reply)
+		}
+		if !ok || (reply.TaskKind != 1 && reply.TaskKind != 2) {
+			log.Printf("Receive done task or socket is closed, exit...")
 			return
 		}
-		if reply.IsMapper {
-
+		if reply.TaskKind == 1 {
+			runMapper(mapf, &reply)
+		} else {
+			runReducer(reducef, &reply)
 		}
 	}
 }
 
 func runMapper(mapf func(string, string) []KeyValue, reply *GetTaskReply) {
-	pattern := fmt.Sprintf("/tmp/Worker%n", os.Getpid())
-
 	file := reply.FileName
 	content, err := os.ReadFile(file)
 	if err != nil {
@@ -55,11 +70,12 @@ func runMapper(mapf func(string, string) []KeyValue, reply *GetTaskReply) {
 	}
 	handlers := make([]*os.File, 0, reply.NReduce)
 	encoders := make([]*json.Encoder, 0, reply.NReduce)
-	success := false
+	success := true
 	for i := 0; i < reply.NReduce; i++ {
-		handler, err := os.CreateTemp(pattern, strconv.Itoa(i))
+		handler, err := os.CreateTemp("/tmp", fmt.Sprintf("mapper-%v-%v", os.Getpid(), i))
 		if err != nil {
-			log.Println("Run mapper failed because unable to create temp file")
+			log.Printf("Run mapper failed because unable to create temp file, err: %v\n", err)
+			success = false
 			break
 		}
 		handlers = append(handlers, handler)
@@ -77,21 +93,25 @@ func runMapper(mapf func(string, string) []KeyValue, reply *GetTaskReply) {
 
 	results := mapf(file, string(content))
 
+	sort.Sort(ByKey(results))
+
 	// write results to file
+	log.Printf("Write mapper output, records: %v\n", len(results))
 	for _, result := range results {
 		key := result.Key
 		hash := ihash(key) % reply.NReduce
 		err := encoders[hash].Encode(result)
 		if err != nil {
-			log.Println("Failed to encode json")
+			log.Printf("Failed to encode json, err: %v", err)
 			return
 		}
 	}
 	for i := 0; i < reply.NReduce; i++ {
 		// go can close file multiple times
 		handlers[i].Close()
-		err := os.Rename(handlers[i].Name(), fmt.Sprintf("Mapper-%n-%n", reply.MapTaskId, i))
+		err := os.Rename(handlers[i].Name(), fmt.Sprintf("Mapper-%v-%v", i, reply.TaskId))
 		if err != nil {
+			// TODO: we might need to do some cleanup here
 			log.Println("Failed to rename mapper output file")
 			return
 		}
@@ -99,14 +119,109 @@ func runMapper(mapf func(string, string) []KeyValue, reply *GetTaskReply) {
 	callTaskDone(reply)
 }
 
-func callTaskDone(reply *GetTaskReply) {
-	args := TaskDoneArgs{TaskId: reply.MapTaskId}
+func runReducer(reducef func(string, []string) string, task *GetTaskReply) {
+	pattern := fmt.Sprintf("Mapper-%v-", task.ReduceTaskNo)
+
+	records := []KeyValue{}
+	err := filepath.Walk("./", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Printf("Got error %v while walk directory for mapper output\n", err)
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), pattern) {
+			kvp, err := readRecordsFromFile(info, reducef)
+			if err != nil {
+				log.Printf("failed to run reduce for each mapper file: %s, err: %v\n", info.Name(), err)
+				return err
+			}
+			records = append(records, kvp...)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("failed to walk directory to read mapper output, err: %v\n", err)
+		return
+	}
+
+	sort.Sort(ByKey(records))
+	err = runReduce(records, reducef, task)
+	if err != nil {
+		log.Printf("failed to reduce on records, err: %v", err)
+		return
+	}
+
+	callTaskDone(task)
+}
+
+func readRecordsFromFile(info os.FileInfo, reducef func(string, []string) string) ([]KeyValue, error) {
+	filename := info.Name()
+	file, err := os.OpenFile(filename, os.O_RDONLY, 0644)
+	if err != nil {
+		log.Printf("failed to read mapper output file %v, err: %v\n", filename, err)
+		return nil, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	kv := KeyValue{}
+	records := []KeyValue{}
+	for decoder.More() {
+		err := decoder.Decode(&kv)
+		if err != nil {
+			log.Printf("failed to decode file %v, err: %v\n", filename, err)
+			return nil, err
+		}
+		records = append(records, kv)
+	}
+	return records, nil
+}
+
+func runReduce(records []KeyValue, reducef func(string, []string) string, task *GetTaskReply) error {
+	temp, err := os.CreateTemp("/tmp", fmt.Sprintf("reducer-%v-%v", os.Getpid(), task.ReduceTaskNo))
+	if err != nil {
+		log.Printf("Failed to create temp file for reducer, err: %v", err)
+		return err
+	}
+	for i := 0; i < len(records); {
+		key := records[i].Key
+		end := i + 1
+		values := []string{records[i].Value}
+		for end < len(records) && key == records[end].Key {
+			values = append(values, records[end].Value)
+			end++
+		}
+		result := reducef(key, values)
+		fmt.Fprintf(temp, "%v %v\n", key, result)
+		i = end
+	}
+
+	err = temp.Close()
+	if err != nil {
+		log.Printf("failed to close temp file, err: %v\n", err)
+		return err
+	}
+	err = os.Rename(temp.Name(), fmt.Sprintf("mr-out-%v", task.ReduceTaskNo))
+	if err != nil {
+		log.Printf("failed to rename reducer output file, err: %v\n", err)
+		return err
+	}
+	return nil
+}
+
+func callTaskDone(task *GetTaskReply) {
+	args := TaskDoneArgs{TaskId: task.TaskId, TaskKind: task.TaskKind}
 	doneReply := TaskDoneReply{}
 	ok := call("Coordinator.TaskDone", &args, &doneReply)
+	id := task.TaskId
+	if task.TaskKind == 2 {
+		id = task.ReduceTaskNo
+	}
 	if ok {
-		log.Printf("Success to register task done, id: %n\n", reply.MapTaskId)
+		log.Printf("Success to register task done, taskKind: %v, id: %v\n", task.TaskKind, id)
 	} else {
-		log.Printf("Failed to register task done, id: %n\n", reply.MapTaskId)
+		log.Printf("Failed to register task done, taskKind: %v, id: %v\n", task.TaskKind, id)
 	}
 }
 

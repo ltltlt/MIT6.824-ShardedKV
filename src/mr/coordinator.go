@@ -17,7 +17,7 @@ type Coordinator struct {
 	WorkingReducer int32
 	TaskChan       chan *GetTaskReply
 	DoneTasks      []bool
-	mu             *sync.RWMutex
+	sync.RWMutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -54,10 +54,10 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	log.SetPrefix("Coordinator ")
 	c := Coordinator{
 		TaskChan:  make(chan *GetTaskReply),
 		DoneTasks: make([]bool, len(files)+nReduce),
-		mu:        &sync.RWMutex{},
 	}
 
 	// Your code here.
@@ -66,11 +66,24 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	atomic.StoreInt32(&c.WorkingReducer, int32(nReduce))
 
 	c.server()
+	go c.createTasks(files, nReduce)
+	go c.monitor()
 	return &c
 }
 
+func (c *Coordinator) monitor() {
+	for true {
+		log.Printf("Remaining mapper: %v, remaining reducer %v\n",
+			atomic.LoadInt32(&c.WorkingMapper), atomic.LoadInt32(&c.WorkingReducer))
+		time.Sleep(time.Second * 5)
+	}
+}
+
 func (c *Coordinator) createTasks(files []string, nReduce int) {
+	log.Printf("Create tasks, files: %v, nReduce: %v\n", files, nReduce)
+
 	for i, file := range files {
+		log.Printf("Add mapper task, taskId: %v, file: %s\n", i, file)
 		c.TaskChan <- newMapperTask(i, file, nReduce)
 	}
 	// wait for all mapper done
@@ -78,10 +91,20 @@ func (c *Coordinator) createTasks(files []string, nReduce int) {
 		time.Sleep(1 * time.Second)
 	}
 
+	log.Println("All mappers are done, register reducer tasks")
+
 	for i := 0; i < nReduce; i++ {
-		c.TaskChan <- newReducerTask(i + len(files))
+		log.Printf("Add reducer task, reducerTaskId: %v\n", i)
+		c.TaskChan <- newReducerTask(i+len(files), i)
 	}
+
+	// wait for all reducer done
+	for atomic.LoadInt32(&c.WorkingReducer) > 0 {
+		time.Sleep(1 * time.Second)
+	}
+	log.Println("All reducers are done, register done task")
+
 	for true {
-		c.TaskChan <- doneTask
+		c.TaskChan <- &doneTaskReply
 	}
 }
