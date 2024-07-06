@@ -20,8 +20,8 @@ package raft
 import (
 	"context"
 	"log"
-	//	"bytes"
 	"math/rand"
+
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,7 +77,7 @@ type Raft struct {
 	matchIndex []int // what have been already sent
 
 	// stable storage
-	currentTerm int
+	currentTerm atomic.Int32
 	votedFor    int // vote for which candidate in this term
 	logEntries  []LogData
 
@@ -87,6 +87,27 @@ type Raft struct {
 	electionStartTime     atomic.Int64
 	latestHeartBeatStatus []atomic.Int32
 	heartbeatId           atomic.Int32
+
+	works  chan work
+	reply  chan work
+	workId atomic.Int32
+}
+
+const (
+	WorkType_SetLeader = iota
+	WorkType_AppendEntries
+	WorkType_RunElection
+	WorkType_ToFollower
+	WorkType_CallAppendEntries
+	WorkType_SendHeartBeatFail
+	WorkType_SendHeartBeatSuccess
+	WorkType_RequestVote
+)
+
+type work struct {
+	workId   int32
+	workType int
+	data     interface{}
 }
 
 type LogData struct {
@@ -97,9 +118,7 @@ type LogData struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.currentTerm, rf.isLeader.Load()
+	return int(rf.currentTerm.Load()), rf.isLeader.Load()
 }
 
 // save Raft's persistent state to stable storage,
@@ -153,7 +172,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term        int
+	Term        int32
 	CandidateId int
 
 	// used to compare log freshness between this and candidate
@@ -165,45 +184,66 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        int
+	Term        int32
 	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	currentTerm := rf.currentTerm
-	if args.Term < rf.currentTerm {
-		log.Printf("RequestVote from node (%v and %v), term (%v vs. %v), which is old, reject", rf.me, args.CandidateId, currentTerm, args.Term)
-		reply.VoteGranted = false
-		reply.Term = currentTerm
-		return
+	workId := rf.workId.Add(1)
+	rf.works <- work{
+		workId:   workId,
+		workType: WorkType_RequestVote,
+		data:     args,
 	}
-	if args.Term > currentTerm {
+	for {
+		result := <-rf.reply
+		if result.workId != workId {
+			rf.reply <- result
+		} else {
+			*reply = *(result.data.(*RequestVoteReply))
+			break
+		}
+	}
+}
+
+func (rf *Raft) runRequestVote(args *RequestVoteArgs) *RequestVoteReply {
+	currTerm := rf.currentTerm.Load()
+	log.Printf("%v Run RequestVote in term %v, from %v", rf.me, rf.currentTerm, args.CandidateId)
+	if args.Term < currTerm {
+		log.Printf("RequestVote from node (%v and %v), term (%v vs. %v), which is old, reject",
+			rf.me, args.CandidateId, currTerm, args.Term)
+		return &RequestVoteReply{
+			VoteGranted: false,
+			Term:        currTerm,
+		}
+	}
+	if args.Term > currTerm {
 		// reset votedFor for new term (might caused by vote split), to ensure new term leader election can elect a leader
 		rf.votedFor = -1
 		// also need to transfer to follower if currently candidate
 		rf.electionStartTime.Store(0)
 
-		rf.currentTerm = args.Term
+		rf.currentTerm.Store(int32(args.Term))
 		rf.isLeader.Store(false)
-
 	}
 	// if already vote for someone else, reject
 	// compare log freshness, reject if mine is fresher than candidate
-	reply.Term = rf.currentTerm
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isUpToDate(args) {
 		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
 		log.Printf("%v grant vote for %v in term %v", rf.me, args.CandidateId, args.Term)
-		return
+		return &RequestVoteReply{
+			VoteGranted: true,
+			Term:        currTerm,
+		}
 	}
 	log.Printf("%v won't grant vote for %v in term %v, already vote for %v",
 		rf.me, args.CandidateId, args.Term, rf.votedFor)
-	reply.VoteGranted = false
-	return
+	return &RequestVoteReply{
+		VoteGranted: false,
+		Term:        currTerm,
+	}
 }
 
 func (rf *Raft) isUpToDate(args *RequestVoteArgs) bool {
@@ -281,56 +321,211 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	rf.dead.Store(1)
 	// Your code here, if desired.
+	rf.dead.Store(1)
 }
 
 func (rf *Raft) killed() bool {
 	return rf.dead.Load() == 1
 }
 
-func (rf *Raft) isTimeOutLocked() bool {
+func (rf *Raft) isTimeOut() bool {
 	return time.Now().UnixMilli()-rf.heartbeatTime.Load() > 500
-}
-
-func (rf *Raft) checkDisconnected() {
-	connectedNode := 0
-	for i := 0; i < len(rf.latestHeartBeatStatus); i++ {
-		v := rf.latestHeartBeatStatus[i].Load()
-		if v == 0 {
-			connectedNode++
-		} else if v == 1 {
-			log.Printf("%v send heartbeat to %v failed", rf.me, i)
-		} else {
-			log.Printf("%v send heartbeat to %v timeout", rf.me, i)
-		}
-		rf.latestHeartBeatStatus[i].Store(0)
-	}
-	if connectedNode <= len(rf.peers)/2 {
-		log.Printf("%v too few connected node %v, change to follower state", rf.me, connectedNode)
-		rf.mu.Lock()
-		rf.isLeader.Store(false)
-		rf.mu.Unlock()
-	}
 }
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
+		// pause for a random amount of time between 50 and 350
+		// milliseconds.
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
-		rf.mu.Lock()
 		if rf.isLeader.Load() {
-			rf.mu.Unlock()
-			rf.sendHeartBeats()
-		} else if rf.isTimeOutLocked() {
+			rf.works <- work{
+				workType: WorkType_CallAppendEntries,
+			}
+		} else if rf.isTimeOut() {
+			rf.works <- work{
+				workType: WorkType_RunElection,
+			}
+		}
+	}
+}
+
+func (rf *Raft) workSendHeartBeats(currTerm int32, heartbeatId int32) {
+	log.Printf("%v leader send heartbeats in term %v", rf.me, currTerm)
+	args := &AppendEntriesArgs{
+		Term:   currTerm,
+		Leader: rf.me,
+	}
+	heartbeatStatus := make(chan int, len(rf.peers))
+	for i, peer := range rf.peers {
+		if rf.me == i {
+			continue
+		}
+		if !rf.isLeader.Load() {
+			break
+		}
+		// notify async to avoid block send heartbeat to others
+		// also avoid to send heartbeat too many times which causes goroutine leakage
+		log.Printf("%v AppendEntries to %v in term %v", rf.me, i, currTerm)
+
+		go func(peerNo int, peer1 *labrpc.ClientEnd, heartbeatId int32) {
+			reply := &AppendEntriesReply{}
+			if !peer1.Call("Raft.AppendEntries", args, reply) {
+				log.Printf("%v failed to AppendEntries for %v in term %v", rf.me, peerNo, currTerm)
+			} else {
+				if reply.IsSuccess == false {
+					rf.works <- work{
+						workType: WorkType_ToFollower,
+					}
+				}
+				heartbeatStatus <- peerNo
+			}
+		}(i, peer, heartbeatId)
+	}
+	timeout := time.After(time.Millisecond * 500)
+	var receiveFrom []int
+L:
+	for len(receiveFrom) <= len(rf.peers)/2 {
+		select {
+		case <-timeout:
+			break L
+		case peerNo := <-heartbeatStatus:
+			receiveFrom = append(receiveFrom, peerNo)
+		}
+	}
+	if len(receiveFrom) <= len(rf.peers)/2 {
+		log.Printf("%v too few connected node %v, change to follower state", rf.me, receiveFrom)
+		rf.works <- work{
+			workId:   heartbeatId,
+			workType: WorkType_SendHeartBeatFail,
+		}
+	} else {
+		rf.works <- work{
+			workId:   heartbeatId,
+			workType: WorkType_SendHeartBeatSuccess,
+		}
+	}
+}
+
+func (rf *Raft) setLeader() {
+	log.Printf("%v is now leader since term %v, update data and notify followers", rf.me, rf.currentTerm)
+	rf.isLeader.Store(true)
+	rf.matchIndex = nil
+	rf.nextIndex = nil
+	rf.electionStartTime.Store(0)
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex = append(rf.nextIndex, rf.lastApplied+1)
+		rf.matchIndex = append(rf.matchIndex, 0)
+	}
+	rf.works <- work{
+		workType: WorkType_CallAppendEntries,
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term       int32
+	Leader     int
+	LogEntries []LogData
+}
+
+type AppendEntriesReply struct {
+	IsSuccess bool
+	Term      int32
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	workId := rf.workId.Add(1)
+	rf.works <- work{
+		workId:   workId,
+		workType: WorkType_AppendEntries,
+		data:     args,
+	}
+	for {
+		result := <-rf.reply
+		if result.workId != workId {
+			rf.reply <- result
+		} else {
+			*reply = *result.data.(*AppendEntriesReply)
+			break
+		}
+	}
+}
+
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
+	rf.latestHeartBeatStatus = make([]atomic.Int32, len(rf.peers))
+	rf.votedFor = -1
+
+	rf.works = make(chan work, 10)
+	rf.reply = make(chan work, 10)
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// Your initialization code here (3A, 3B, 3C).
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	// start ticker goroutine to start elections
+	go rf.ticker()
+	go rf.work()
+
+	return rf
+}
+
+func (rf *Raft) work() {
+	var lastSendHeartBeatSuccessId int32
+	for !rf.killed() {
+		work := <-rf.works
+		switch work.workType {
+		case WorkType_SetLeader:
+			rf.setLeader()
+		case WorkType_CallAppendEntries:
+			rf.heartbeatTime.Store(time.Now().UnixMilli())
+			go rf.workSendHeartBeats(rf.currentTerm.Load(), rf.workId.Add(1))
+		case WorkType_AppendEntries:
+			reply := rf.workAppendEntries(work.data.(*AppendEntriesArgs))
+			work.data = reply
+			rf.reply <- work
+		case WorkType_SendHeartBeatSuccess:
+			if work.workId > lastSendHeartBeatSuccessId {
+				lastSendHeartBeatSuccessId = work.workId
+			}
+		case WorkType_SendHeartBeatFail:
+			if work.workId > lastSendHeartBeatSuccessId {
+				rf.isLeader.Store(false)
+			}
+			// for old heartbeat, ignore it
+		case WorkType_RequestVote:
+			reply := rf.runRequestVote(work.data.(*RequestVoteArgs))
+			work.data = reply
+			rf.reply <- work
+		case WorkType_ToFollower:
+			rf.isLeader.Store(false)
+		case WorkType_RunElection:
 			electionStartTime := rf.electionStartTime.Load()
 			if electionStartTime > 0 {
 				log.Printf("%v detect timeout %v, while election is ongoing, startTime %v...",
 					rf.me, time.UnixMilli(rf.heartbeatTime.Load()).Format(time.RFC3339),
 					time.UnixMilli(electionStartTime).Format(time.RFC3339))
-				rf.mu.Unlock()
 			} else {
 				// start new election
 				log.Printf("%v detect timeout %v, start election...",
@@ -341,29 +536,37 @@ func (rf *Raft) ticker() {
 					lastLogTerm = rf.logEntries[len(rf.logEntries)-1].Term
 				}
 				lastLogIndex := len(rf.logEntries) - 1
-				rf.mu.Unlock()
-				go rf.runElection(lastLogIndex, lastLogTerm)
+				// we should set votefor to me
+				// if not, we might still vote for someone else in old term and causes me cannot win (only 3 of 5 nodes are alive case)
+				rf.votedFor = rf.me
+				go rf.workRunElection(lastLogIndex, lastLogTerm, rf.currentTerm.Add(1))
 			}
-		} else {
-			rf.mu.Unlock()
 		}
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
-func (rf *Raft) runElection(lastLogIndex int, lastLogTerm int) {
-	rf.mu.Lock()
-	rf.currentTerm++
-	currTerm := rf.currentTerm
-
-	// we should set votefor to me
-	// if not, we might still vote for someone else in old term and causes me cannot win (only 3 of 5 nodes are alive case)
-	rf.votedFor = rf.me
-	rf.mu.Unlock()
+func (rf *Raft) workAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
+	reply := AppendEntriesReply{}
+	currTerm := rf.currentTerm.Load()
+	if args.Term >= currTerm {
+		log.Printf("%v receive AppendEntries from %v for term %v", rf.me, args.Leader, args.Term)
+		rf.heartbeatTime.Store(time.Now().UnixMilli())
+		rf.currentTerm.Store(args.Term)
+		if rf.electionStartTime.Swap(0) > 0 {
+			log.Printf("%v receive AppendEntries from %v when election, stop election", rf.me, args.Leader)
+		}
+		rf.votedFor = -1
+		reply.IsSuccess = true
+		rf.isLeader.Store(false)
+	} else {
+		log.Printf("%v receive old AppendEntries from %v for term %v, ignore", rf.me, args.Leader, args.Term)
+		reply.IsSuccess = false
+		reply.Term = currTerm
+	}
+	return &reply
+}
+func (rf *Raft) workRunElection(lastLogIndex int, lastLogTerm int, term int32) {
+	currTerm := term
 
 	args := &RequestVoteArgs{
 		Term:         currTerm,
@@ -421,138 +624,12 @@ L:
 	cancel()
 	if voteCount >= targetVoteCount {
 		log.Printf("%v receive vote from %v, will become leader", rf.me, voters)
-		rf.setLeader()
+		rf.works <- work{
+			workType: WorkType_SetLeader,
+		}
 		return
 	}
 
 	log.Printf("%v didn't get enough vote (%v, %v) in time for term %v", rf.me, voters, targetVoteCount, currTerm)
 	rf.electionStartTime.Store(0)
-}
-
-func (rf *Raft) sendHeartBeats() {
-	rf.mu.Lock()
-	currTerm := rf.currentTerm
-	rf.mu.Unlock()
-	heartbeatId := rf.heartbeatId.Add(1)
-	log.Printf("%v leader send heartbeats in term %v", rf.me, currTerm)
-	args := &AppendEntriesArgs{
-		Term:   currTerm,
-		Leader: rf.me,
-	}
-	for i, peer := range rf.peers {
-		if rf.me == i {
-			rf.mu.Lock()
-			rf.heartbeatTime.Store(time.Now().UnixMilli())
-			rf.mu.Unlock()
-			continue
-		}
-		if !rf.isLeader.Load() {
-			break
-		}
-		// notify async to avoid block send heartbeat to others
-		// also avoid to send heartbeat too many times which causes goroutine leakage
-		log.Printf("%v AppendEntries to %v in term %v", rf.me, i, currTerm)
-		rf.latestHeartBeatStatus[i].Store(2)
-		go func(peerNo int, peer1 *labrpc.ClientEnd, heartbeatId int32) {
-			reply := &AppendEntriesReply{}
-			if !peer1.Call("Raft.AppendEntries", args, reply) {
-				if rf.heartbeatId.Load() == heartbeatId {
-					log.Printf("%v failed to AppendEntries for %v in term %v", rf.me, peerNo, currTerm)
-					rf.latestHeartBeatStatus[peerNo].Store(1)
-				}
-			} else {
-				if reply.IsSuccess == false {
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.isLeader.Store(false)
-					}
-					rf.mu.Unlock()
-				}
-				if rf.heartbeatId.Load() == heartbeatId {
-					rf.latestHeartBeatStatus[peerNo].Store(0)
-				}
-			}
-		}(i, peer, heartbeatId)
-	}
-
-	// check disconnected after send heartbeat (wait for sometimes to make sure it returned)
-	// if not returned in time, it's timeout
-	time.AfterFunc(time.Millisecond*500, rf.checkDisconnected)
-}
-
-func (rf *Raft) setLeader() {
-	rf.mu.Lock()
-	log.Printf("%v is now leader since term %v, update data and notify followers", rf.me, rf.currentTerm)
-	rf.isLeader.Store(true)
-	rf.matchIndex = nil
-	rf.nextIndex = nil
-	rf.electionStartTime.Store(0)
-	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex = append(rf.nextIndex, rf.lastApplied+1)
-		rf.matchIndex = append(rf.matchIndex, 0)
-	}
-	rf.mu.Unlock()
-	rf.sendHeartBeats()
-}
-
-type AppendEntriesArgs struct {
-	Term       int
-	Leader     int
-	LogEntries []LogData
-}
-
-type AppendEntriesReply struct {
-	IsSuccess bool
-	Term      int
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term >= rf.currentTerm {
-		log.Printf("%v receive AppendEntries from %v for term %v", rf.me, args.Leader, args.Term)
-		rf.heartbeatTime.Store(time.Now().UnixMilli())
-		rf.currentTerm = args.Term
-		if rf.electionStartTime.Swap(0) > 0 {
-			log.Printf("%v receive AppendEntries from %v when election, stop election", rf.me, args.Leader)
-		}
-		rf.votedFor = -1
-		reply.IsSuccess = true
-		rf.isLeader.Store(false)
-	} else {
-		log.Printf("%v receive old AppendEntries from %v for term %v, ignore", rf.me, args.Leader, args.Term)
-		reply.IsSuccess = false
-		reply.Term = rf.currentTerm
-	}
-}
-
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-	rf.latestHeartBeatStatus = make([]atomic.Int32, len(rf.peers))
-	rf.votedFor = -1
-
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	// Your initialization code here (3A, 3B, 3C).
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	// start ticker goroutine to start elections
-	go rf.ticker()
-
-	return rf
 }
