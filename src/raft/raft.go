@@ -18,7 +18,10 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 
@@ -53,6 +56,8 @@ type ApplyMsg struct {
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
+	// mu is only used to protect data structure in 3B (nextIndex, matchIndex, logEntries)
+	// because they are not easy to use atomic to replace
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -135,6 +140,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	buffer := &bytes.Buffer{}
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.logEntries)
+	state := buffer.Bytes()
+	rf.persister.Save(state, nil)
 }
 
 // restore previously persisted state.
@@ -155,6 +168,26 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	var currentTerm int32
+	var votedFor int
+	var logEntries []LogData
+	err := decoder.Decode(&currentTerm)
+	if err != nil {
+		panic(fmt.Sprintf("Decode invalid currentTerm with err %v", err))
+	}
+	err = decoder.Decode(&votedFor)
+	if err != nil {
+		panic(fmt.Sprintf("Decode invalid votedFor with err %v", err))
+	}
+	err = decoder.Decode(&logEntries)
+	if err != nil {
+		panic(fmt.Sprintf("Decode invalid logEntries with err %v", err))
+	}
+	rf.currentTerm.Store(currentTerm)
+	rf.votedFor = votedFor
+	rf.logEntries = logEntries
 }
 
 // the service says it has created a snapshot that has
@@ -419,13 +452,13 @@ func (rf *Raft) setLeader() {
 	rf.lastAppliedIdx = len(rf.logEntries) - 1
 	rf.printf("become leader since term %v, lastAppliedIdx: %v", rf.currentTerm.Load(), rf.lastAppliedIdx)
 	rf.isLeader.Store(true)
-	rf.matchIndex = nil
-	rf.nextIndex = nil
 	rf.electionStartTime.Store(0)
+	rf.mu.Lock()
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex = append(rf.nextIndex, rf.lastAppliedIdx+1)
-		rf.matchIndex = append(rf.matchIndex, -1)
+		rf.nextIndex[i] = rf.lastAppliedIdx + 1
+		rf.matchIndex[i] = -1
 	}
+	rf.mu.Unlock()
 	rf.works <- work{
 		workType: WorkType_CallAppendEntries,
 	}
@@ -483,6 +516,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.votedFor = -1
 
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 	rf.works = make(chan work, 10)
 	rf.reply = make(chan work, 10)
 	rf.commitIdx.Store(-1)
@@ -564,6 +599,8 @@ func (rf *Raft) work() {
 func (rf *Raft) updateCommitIdx() {
 	// update commit index
 	commitIdx := int(rf.commitIdx.Load())
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for i := len(rf.logEntries) - 1; i > commitIdx; i-- {
 		matchCount := 1
 		for j := range rf.peers {
@@ -587,14 +624,13 @@ func (rf *Raft) sendCommittedToChan(applyCh chan ApplyMsg) {
 	lastSendToChanIdx := -1
 	for {
 		commitIdx := int(rf.commitIdx.Load())
-		if len(rf.logEntries)-1 < commitIdx {
-			// when log is commited on leader, but not replicated to me
-			commitIdx = len(rf.logEntries) - 1
-		}
+		rf.mu.Lock()
+		entries := rf.logEntries
+		rf.mu.Unlock()
 		for lastSendToChanIdx < commitIdx {
 			lastSendToChanIdx++
 			cmdIdx := lastSendToChanIdx
-			command := rf.logEntries[cmdIdx]
+			command := entries[cmdIdx]
 			rf.printf("send %v to applyCh", cmdIdx)
 			applyCh <- ApplyMsg{
 				Command:      command.Command,
@@ -607,12 +643,14 @@ func (rf *Raft) sendCommittedToChan(applyCh chan ApplyMsg) {
 }
 
 func (rf *Raft) followerAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
-	reply := AppendEntriesReply{}
+	var reply *AppendEntriesReply
 	currTerm := rf.currentTerm.Load()
 	if args.Term == currTerm && rf.receiveAppendEntriesId > args.AppendEntriesId {
 		rf.printf("receive old AppendEntries from %v for appendEntriesId %v, ignore", args.Leader, args.AppendEntriesId)
-		reply.IsSuccess = true
-		reply.Term = currTerm
+		reply = &AppendEntriesReply{
+			IsSuccess: true,
+			Term:      currTerm,
+		}
 	} else if args.Term >= currTerm {
 		rf.printf("receive AppendEntries (heartbeat: %v) from %v for term %v, leaderCommitIdx: %v",
 			len(args.LogEntries) == 0, args.Leader, args.Term, args.LeaderCommitIdx)
@@ -631,38 +669,45 @@ func (rf *Raft) followerAppendEntries(args *AppendEntriesArgs) *AppendEntriesRep
 		// because our records might not updated to 124 in time
 		// me will report 123 as commited while it's not
 		if args.LeaderCommitIdx > rf.commitIdx.Load() {
+			rf.mu.Lock()
 			if rf.logEntries[len(rf.logEntries)-1].Term == args.Term {
 				// we don't commit on previous term, only when it's the latest term
 				// TODO: doesn't this check necessary?
 				rf.commitIdx.Store(min32(args.LeaderCommitIdx, int32(rf.lastAppliedIdx)))
 			}
+			rf.mu.Unlock()
 		}
 
 		if len(args.LogEntries) == 0 {
-			return &AppendEntriesReply{
+			reply = &AppendEntriesReply{
 				IsSuccess: true,
 				Term:      currTerm,
 			}
 		} else {
-			return rf.doAppendEntries(args.LogEntries, currTerm, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommitIdx)
+			reply = rf.doAppendEntries(args.LogEntries, currTerm, args.PrevLogIndex, args.PrevLogTerm)
 		}
 	} else {
 		rf.printf("receive old AppendEntries from %v for term %v, ignore", args.Leader, args.Term)
-		reply.IsSuccess = false
-		reply.Term = currTerm
+		reply = &AppendEntriesReply{
+			IsSuccess: false,
+			Term:      currTerm,
+		}
 	}
-	return &reply
+	return reply
 }
 
-func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32, prevLogIndex int, prevLogTerm int32, leaderCommitIndex int32) *AppendEntriesReply {
+func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32, prevLogIndex int,
+	prevLogTerm int32) *AppendEntriesReply {
 	reply := AppendEntriesReply{
 		Term: currTerm,
 	}
 	if prevLogIndex == -1 {
 		rf.printf("Append all entries in term %v", currTerm)
+		rf.mu.Lock()
 		rf.logEntries = entries
+		rf.lastAppliedIdx = len(entries) - 1
+		rf.mu.Unlock()
 		reply.IsSuccess = true
-		rf.lastAppliedIdx = len(rf.logEntries) - 1
 	} else if prevLogIndex >= len(rf.logEntries) {
 		rf.printf("prevLogIndex doesn't match")
 		reply.IsSuccess = false
@@ -672,8 +717,10 @@ func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32, prevLogIndex 
 			rf.printf("prevLogTerm doesn't match")
 			reply.IsSuccess = false
 		} else {
+			rf.mu.Lock()
 			rf.logEntries = append(rf.logEntries[:prevLogIndex+1], entries...)
 			rf.lastAppliedIdx = len(rf.logEntries) - 1
+			rf.mu.Unlock()
 			reply.IsSuccess = true
 		}
 	}
@@ -758,12 +805,14 @@ func (rf *Raft) leaderStartCommand(command interface{}) []int {
 	// followers will be synced during heartbeat
 	term := rf.currentTerm.Load()
 	if rf.isLeader.Load() {
+		rf.mu.Lock()
 		rf.lastAppliedIdx = len(rf.logEntries)
+		cmdIdx := rf.lastAppliedIdx
 		rf.logEntries = append(rf.logEntries, LogData{
 			Command: command,
 			Term:    term,
 		})
-		cmdIdx := len(rf.logEntries) - 1
+		rf.mu.Unlock()
 		return []int{cmdIdx, int(term), 1}
 	}
 	return []int{-1, int(term), 0}
@@ -785,9 +834,11 @@ func (rf *Raft) appendEntriesToFollower(peer int, entries []LogData, appendEntri
 			peer, currTerm, rf.commitIdx.Load(), nextIndex, lastLogIndex)
 		args.PrevLogIndex = nextIndex - 1
 		args.PrevLogTerm = -1
+		rf.mu.Lock()
 		if args.PrevLogIndex >= 0 {
 			args.PrevLogTerm = entries[args.PrevLogIndex].Term
 		}
+		rf.mu.Unlock()
 		args.LogEntries = entries[nextIndex:]
 	} else {
 		rf.printf("AppendEntries to %v in term %v, heartbeat only", peer, currTerm)
@@ -803,8 +854,10 @@ func (rf *Raft) appendEntriesToFollower(peer int, entries []LogData, appendEntri
 		if reply.IsSuccess {
 			appendEntries := args.LogEntries
 			if len(appendEntries) > 0 {
+				rf.mu.Lock()
 				rf.nextIndex[peer] = nextIndex + len(appendEntries)
 				rf.matchIndex[peer] = nextIndex + len(appendEntries) - 1
+				rf.mu.Unlock()
 			}
 		} else {
 			if currTerm < reply.Term {
@@ -814,7 +867,9 @@ func (rf *Raft) appendEntriesToFollower(peer int, entries []LogData, appendEntri
 				}
 			} else {
 				rf.printf("failed to append entries to follower %v due to log inconsistent, decrement nextIndex and retry", peer)
+				rf.mu.Lock()
 				rf.nextIndex[peer]--
+				rf.mu.Unlock()
 				rf.appendEntriesToFollower(peer, entries, appendEntriesId, nil)
 			}
 		}
