@@ -45,3 +45,34 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+func consumeAll(ch chan struct{}) {
+L:
+	for {
+		select {
+		case <-ch:
+		default:
+			break L
+		}
+	}
+}
+
+func consumeAllReasons(ch chan string) []string {
+	var reasons []string
+L:
+	for {
+		select {
+		case reason := <-ch:
+			reasons = append(reasons, reason)
+		default:
+			break L
+		}
+	}
+	return reasons
+}
+
+func cloneEntries(entries []LogData) []LogData {
+	x := make([]LogData, len(entries))
+	copy(x, entries)
+	return x
+}

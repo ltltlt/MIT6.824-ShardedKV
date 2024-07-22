@@ -99,6 +99,10 @@ type Raft struct {
 	snapshotEndIndex int
 	snapshotEndTerm  int32
 	snapshot         []byte
+
+	updateApplyCh            chan struct{}
+	triggerUpdateCommitIdxCh chan struct{}
+	triggerAppendEntriesCh   chan string
 }
 
 const (
@@ -106,17 +110,8 @@ const (
 	WorkType_AppendEntries
 	WorkType_RunElection
 	WorkType_ToFollower
-	WorkType_CallAppendEntries
-	WorkType_SendHeartBeatFail
-	WorkType_SendHeartBeatSuccess
 	WorkType_RequestVote
 	WorkType_StartCommand
-)
-
-const (
-	electionTimeOut      = time.Millisecond * 700
-	heartbeatTimeOutMs   = 700
-	appendEntriesTimeOut = time.Millisecond * 500
 )
 
 type work struct {
@@ -198,6 +193,11 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.logEntries = logEntries
 	rf.snapshotEndIndex = snapshotEndIndex - 1
 	rf.snapshotEndTerm = snapshotEndTerm - 1
+	rf.lastAppliedIdx = rf.snapshotEndIndex + len(logEntries)
+
+	if rf.snapshotEndIndex >= 0 {
+		rf.updateApplyCh <- struct{}{}
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -257,6 +257,7 @@ func (rf *Raft) runRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 			rf.persist()
 		}
 	}()
+	rf.mu.Lock()
 	if args.Term > currTerm {
 		// reset votedFor for new term (might caused by vote split), to ensure new term leader election can elect a leader
 		rf.votedFor = -1
@@ -264,12 +265,12 @@ func (rf *Raft) runRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		rf.electionStartTime.Store(0)
 
 		rf.currentTerm.Store(int32(args.Term))
+		rf.receiveAppendEntriesId = 0
 		rf.isLeader.Store(false)
 		runPersist = true
 	}
 	// if already vote for someone else, reject
 	// compare log freshness, reject if mine is fresher than candidate
-	rf.mu.Lock()
 	votedFor := rf.votedFor
 	if votedFor == -1 || votedFor == args.CandidateId {
 		if rf.isUpToDateLocked(args) {
@@ -282,6 +283,8 @@ func (rf *Raft) runRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 			// to give up the election
 			// see https://github.com/nats-io/nats-server/discussions/5023
 			rf.heartbeatTime.Store(time.Now().UnixMilli())
+
+			rf.receiveAppendEntriesId = -1
 
 			rf.mu.Unlock()
 
@@ -381,7 +384,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			reply := <-rf.reply
 			if reply.workId == workId {
 				data := reply.data.([]int)
-				rf.printf("StartCommand result: %v (cmdIdx, term, isLeader), %v", data, command)
+				rf.printf("StartCommand result: %v (cmdIdx, term, isLeader)", data)
 				return data[0] + 1, data[1], data[2] == 1
 			} else {
 				rf.reply <- reply
@@ -426,11 +429,7 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 
 		isLeader := rf.isLeader.Load()
-		if isLeader {
-			rf.works <- work{
-				workType: WorkType_CallAppendEntries,
-			}
-		} else if rf.isTimeOut() {
+		if !isLeader && rf.isTimeOut() {
 			rf.works <- work{
 				workType: WorkType_RunElection,
 			}
@@ -446,7 +445,7 @@ func (rf *Raft) workSendAppendEntries(currTerm int32, appendEntriesId int32) {
 			continue
 		}
 		if !rf.isLeader.Load() {
-			break
+			return
 		}
 
 		go rf.appendEntriesToFollower(i, appendEntriesId, heartbeatStatus, currTerm)
@@ -465,15 +464,6 @@ L:
 	if len(receiveFrom) <= len(rf.peers)/2 {
 		rf.printf("too few connected node %v in term %v, id %v",
 			receiveFrom, currTerm, appendEntriesId)
-		rf.works <- work{
-			workId:   appendEntriesId,
-			workType: WorkType_SendHeartBeatFail,
-		}
-	} else {
-		rf.works <- work{
-			workId:   appendEntriesId,
-			workType: WorkType_SendHeartBeatSuccess,
-		}
 	}
 }
 
@@ -481,7 +471,7 @@ func (rf *Raft) setLeader() {
 	rf.electionStartTime.Store(0)
 	rf.isLeader.Store(true)
 	rf.mu.Lock()
-	rf.lastAppliedIdx = len(rf.logEntries) - 1 + int(rf.snapshotEndIndex) + 1
+	rf.lastAppliedIdx = len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.lastAppliedIdx + 1
 		rf.matchIndex[i] = -1
@@ -491,9 +481,8 @@ func (rf *Raft) setLeader() {
 
 	rf.printf("become leader since term %v, lastAppliedIdx: %v", rf.currentTerm.Load(), rf.lastAppliedIdx)
 
-	rf.works <- work{
-		workType: WorkType_CallAppendEntries,
-	}
+	rf.triggerAppendEntriesCh <- "become leader"
+	go rf.goAppendEntries()
 }
 
 type AppendEntriesArgs struct {
@@ -563,6 +552,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastAppliedIdx = -1
 	rf.snapshotEndIndex = -1
 
+	rf.updateApplyCh = make(chan struct{}, 10)
+	rf.triggerUpdateCommitIdxCh = make(chan struct{}, 10)
+	rf.triggerAppendEntriesCh = make(chan string, 10)
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	// Your initialization code here (3A, 3B, 3C).
@@ -574,40 +567,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.work()
-	go rf.sendCommittedToChan(applyCh)
+	go rf.sendCommittedToApplyCh(applyCh)
+	go rf.goUpdateCommitIdx()
+	go rf.goAppendEntries()
 
 	return rf
 }
 
 func (rf *Raft) work() {
-	var lastSendHeartBeatSuccessId int32
-	var lastAppendEntriesId int32
 	for !rf.killed() {
 		work := <-rf.works
 		switch work.workType {
 		case WorkType_SetLeader:
 			rf.setLeader()
-		case WorkType_CallAppendEntries:
-			rf.heartbeatTime.Store(time.Now().UnixMilli())
-			rf.updateCommitIdx()
-			lastAppendEntriesId = rf.workId.Add(1)
-			rf.lastAppendEntriesId.Store(lastAppendEntriesId)
-			go rf.workSendAppendEntries(rf.currentTerm.Load(), lastAppendEntriesId)
 		case WorkType_AppendEntries:
 			reply := rf.followerAppendEntries(work.data.(*AppendEntriesArgs))
 			work.data = reply
 			rf.reply <- work
-		case WorkType_SendHeartBeatSuccess:
-			if work.workId > lastSendHeartBeatSuccessId {
-				lastSendHeartBeatSuccessId = work.workId
-			}
-		case WorkType_SendHeartBeatFail:
-			//if work.workId == lastAppendEntriesId {
-			//	// last append entries failed
-			//	rf.printf("AppendEntries failed in id %v, switch to follower state", work.workId)
-			//	rf.isLeader.Store(false)
-			//}
-			// for old heartbeat, ignore it
 		case WorkType_RequestVote:
 			reply := rf.runRequestVote(work.data.(*RequestVoteArgs))
 			work.data = reply
@@ -622,23 +598,24 @@ func (rf *Raft) work() {
 			electionStartTime := rf.electionStartTime.Load()
 			if electionStartTime > 0 {
 				rf.printf("detect timeout %v, while election is ongoing, startTime %v...",
-					time.UnixMilli(rf.heartbeatTime.Load()).Format(time.RFC3339),
-					time.UnixMilli(electionStartTime).Format(time.RFC3339))
+					time.UnixMilli(rf.heartbeatTime.Load()).Format(time.StampMilli),
+					time.UnixMilli(electionStartTime).Format(time.StampMilli))
 			} else {
 				// start new election
 
 				// reset timeout to avoid run election in every ticker
-				rf.heartbeatTime.Store(time.Now().UnixMilli())
+				now := time.Now()
+				rf.heartbeatTime.Store(now.UnixMilli())
 				// we should set votefor to me
 				// if not, we might still vote for someone else in old term and causes me cannot win (only 3 of 5 nodes are alive case)
+				rf.mu.Lock()
 				rf.votedFor = rf.me
 				newTerm := rf.currentTerm.Add(1)
-				rf.persist()
+				rf.persistLocked()
 				rf.printf("detect timeout %v, start election in new term %v...",
-					time.UnixMilli(rf.heartbeatTime.Load()).Format(time.RFC3339), newTerm)
+					now.Format(time.StampMilli), newTerm)
 				rf.electionStartTime.Store(time.Now().UnixMilli())
 				lastLogTerm := int32(-1)
-				rf.mu.Lock()
 				lastLogIdx := len(rf.logEntries) - 1
 				snapshotEndIdx := rf.snapshotEndIndex
 				if lastLogIdx >= 0 {
@@ -655,17 +632,44 @@ func (rf *Raft) work() {
 	}
 }
 
+func (rf *Raft) goAppendEntries() {
+	for rf.isLeader.Load() {
+		timeout := time.After(appendEntriesInterval)
+		var reasons []string
+		select {
+		case <-timeout:
+			reasons = []string{"Heartbeat"}
+		case reason := <-rf.triggerAppendEntriesCh:
+			reasons = consumeAllReasons(rf.triggerAppendEntriesCh)
+			reasons = append(reasons, reason)
+		}
+		id := rf.lastAppendEntriesId.Add(1)
+		rf.printf("Trigger AppendEntries id %v, reasons: %v", id, reasons)
+		rf.heartbeatTime.Store(time.Now().UnixMilli())
+
+		// separate goroutine to avoid one node timeout block other nodes
+		go rf.workSendAppendEntries(rf.currentTerm.Load(), id)
+	}
+}
+
+func (rf *Raft) goUpdateCommitIdx() {
+	for {
+		<-rf.triggerUpdateCommitIdxCh
+		consumeAll(rf.triggerUpdateCommitIdxCh)
+		rf.updateCommitIdx()
+	}
+}
+
 func (rf *Raft) updateCommitIdx() {
-	// update commit index
 	rf.mu.Lock()
-	snapshotEndIdx := int(rf.snapshotEndIndex)
-	commitIdx := int(rf.commitIdx.Load())
-	commitLogIdx := max(commitIdx-snapshotEndIdx-1, 0)
 	defer rf.mu.Unlock()
+	snapshotEndIdx := rf.snapshotEndIndex
+	commitIdx := int(rf.commitIdx.Load())
+	commitLogIdx := commitIdx - snapshotEndIdx - 1
 	for i := len(rf.logEntries) - 1; i > commitLogIdx; i-- {
 		matchCount := 1
-		for j := range rf.peers {
-			if j != rf.me && rf.matchIndex[j] >= i+snapshotEndIdx+1 {
+		for j, matchIndex := range rf.matchIndex {
+			if j != rf.me && matchIndex >= i+snapshotEndIdx+1 {
 				matchCount++
 			}
 		}
@@ -675,17 +679,27 @@ func (rf *Raft) updateCommitIdx() {
 				i += snapshotEndIdx + 1
 				rf.printf("Leader update commitIdx to %v", i)
 				rf.commitIdx.Store(int32(i))
+
+				rf.updateApplyCh <- struct{}{}
+				if rf.isLeader.Load() {
+					// update follower's commit index
+					rf.triggerAppendEntriesCh <- "update commitIdx"
+				}
 				return
 			}
 		}
 	}
 }
 
-func (rf *Raft) sendCommittedToChan(applyCh chan ApplyMsg) {
+func (rf *Raft) sendCommittedToApplyCh(applyCh chan ApplyMsg) {
 	// send lastSendToChan ~ commitIdx to channel (lab requirement) and avoid blocking
 	lastSendToChanIdx := -1
 	snapshotEndIndex := -1
+
 	for {
+		<-rf.updateApplyCh
+		consumeAll(rf.updateApplyCh)
+
 		commitIdx := int(rf.commitIdx.Load())
 		var messages []ApplyMsg
 
@@ -702,7 +716,7 @@ func (rf *Raft) sendCommittedToChan(applyCh chan ApplyMsg) {
 				SnapshotTerm:  int(rf.snapshotEndTerm),
 			})
 			// need to reset this
-			lastSendToChanIdx = int(newSnapshotEndIndex)
+			lastSendToChanIdx = newSnapshotEndIndex
 		}
 
 		if lastSendToChanIdx < commitIdx {
@@ -711,7 +725,17 @@ func (rf *Raft) sendCommittedToChan(applyCh chan ApplyMsg) {
 			for lastSendToChanIdx < commitIdx {
 				lastSendToChanIdx++
 				cmdIdx := lastSendToChanIdx
-				cmdLogIdx := cmdIdx - 1 - snapshotEndIndex
+				cmdLogIdx := cmdIdx - 1 - newSnapshotEndIndex
+				if cmdLogIdx < 0 {
+					// tricky cases: commitIdx (65) < newSnapshotEndIdx (68), while oldSnapshotEndIdx (58) < commitIdx
+					// happens when we just have a snapshot installed from leader but since leaderCommitIdx=65 (might caused by leader restart so it's commit idx < it's snapshot),
+					// so we cannot change myCommitIdx to 68
+					// in this case, we cannot find entries not commited since they already snapshoted,
+					// so we need to wait for commitIdx >= newSnapshotEndIdx
+					rf.printf("commitIdx (%v) < snapshotEndIdx (%v), lastAppliedIdx %v, we don't have entries to send to applyCh, need to wait for commitIdx update",
+						commitIdx, newSnapshotEndIndex, rf.lastAppliedIdx)
+					break
+				}
 				command := rf.logEntries[cmdLogIdx]
 				messages = append(messages, ApplyMsg{
 					Command:      command.Command,
@@ -725,64 +749,81 @@ func (rf *Raft) sendCommittedToChan(applyCh chan ApplyMsg) {
 		for _, msg := range messages {
 			applyCh <- msg
 		}
-
-		time.Sleep(time.Millisecond * 200)
 	}
 }
 
 func (rf *Raft) followerAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
 	var reply *AppendEntriesReply
+	rf.printf("followerAppendEntries from %v, term %v, id %v", args.Leader, args.Term, args.AppendEntriesId)
 	rf.mu.Lock()
 	currTerm := rf.currentTerm.Load()
-	lastAppliedIdx := rf.lastAppliedIdx
-	rf.mu.Unlock()
-	if args.Term == currTerm && rf.receiveAppendEntriesId > args.AppendEntriesId {
-		rf.printf("receive old AppendEntries from %v for appendEntriesId %v, ignore",
-			args.Leader, args.AppendEntriesId)
-		reply = &AppendEntriesReply{
-			IsSuccess: true,
-			Term:      currTerm,
-		}
-	} else if args.Term >= currTerm {
-		rf.printf("receive AppendEntries (entries: %v) from %v for term %v, id %v, leaderCommitIdx: %v, lastAppliedIdx %v",
-			len(args.LogEntries), args.Leader, args.Term, args.AppendEntriesId, args.LeaderCommitIdx, lastAppliedIdx)
 
-		rf.receiveHeartbeat(args.Term, currTerm, args.Leader)
-
-		// we cannot directly update commitIdx, because me might store stale data
-		// consider I StartCommand on 123 but it's not committed (no enough follower)
-		// node 2 and 3 StartCommand on 124 and committed, and when node 2 or 3 update my commitIdx
-		// because our records might not updated to 124 in time
-		// me will report 123 as commited while it's not
-		if args.LeaderCommitIdx > rf.commitIdx.Load() {
-			rf.mu.Lock()
-			if len(rf.logEntries) > 0 && rf.logEntries[len(rf.logEntries)-1].Term == args.Term {
-				// we don't commit on previous term, only when it's the latest term
-				// TODO: does this check necessary?
-				commitIdx := min32(args.LeaderCommitIdx, int32(rf.lastAppliedIdx))
-				rf.printf("Follower update commitIdx to %v", commitIdx)
-				rf.commitIdx.Store(commitIdx)
-			}
-			rf.mu.Unlock()
-		}
-
-		reply = rf.doAppendEntries(args.LogEntries, currTerm, args.PrevLogIndex, args.PrevLogTerm)
-	} else {
+	if args.Term < currTerm {
 		rf.printf("receive old AppendEntries from %v for term %v, ignore", args.Leader, args.Term)
-		reply = &AppendEntriesReply{
+		rf.mu.Unlock()
+		return &AppendEntriesReply{
 			IsSuccess: false,
 			Term:      currTerm,
 		}
 	}
+
+	lastAppliedIdx := rf.lastAppliedIdx
+	if args.Term == currTerm && rf.receiveAppendEntriesId > args.AppendEntriesId {
+		rf.printf("receive old AppendEntries from %v for appendEntriesId %v, latest id %v, ignore...",
+			args.Leader, args.AppendEntriesId, rf.receiveAppendEntriesId)
+		rf.mu.Unlock()
+		return &AppendEntriesReply{
+			IsSuccess: true,
+			Term:      currTerm,
+		}
+	}
+
+	rf.receiveAppendEntriesId = args.AppendEntriesId
+	rf.mu.Unlock()
+
+	rf.printf("receive AppendEntries (entries: %v) from %v for term %v, id %v, leaderCommitIdx: %v, lastAppliedIdx %v",
+		len(args.LogEntries), args.Leader, args.Term, args.AppendEntriesId, args.LeaderCommitIdx, lastAppliedIdx)
+
+	needPersist := rf.receiveHeartbeat(args.Term, currTerm, args.Leader)
+
+	// we cannot directly update commitIdx, because me might store stale data
+	// consider I StartCommand on 123 but it's not committed (no enough follower)
+	// node 2 and 3 StartCommand on 124 and committed, and when node 2 or 3 update my commitIdx
+	// because our records might not updated to 124 in time
+	// me will report 123 as commited while it's not
+	oldCommitIdx := rf.commitIdx.Load()
+	newCommitIdx := oldCommitIdx
+	if args.LeaderCommitIdx > oldCommitIdx {
+		rf.mu.Lock()
+		if len(rf.logEntries) > 0 && rf.logEntries[len(rf.logEntries)-1].Term == args.Term {
+			// we don't commit on previous term, only when it's the latest term
+			// TODO: does this check necessary?
+			newCommitIdx = min32(args.LeaderCommitIdx, int32(rf.lastAppliedIdx))
+			rf.printf("Follower update commitIdx to %v", newCommitIdx)
+			rf.commitIdx.Store(newCommitIdx)
+		}
+		rf.mu.Unlock()
+	}
+	if newCommitIdx != oldCommitIdx {
+		rf.updateApplyCh <- struct{}{}
+	}
+
+	var needPersist1 bool
+	needPersist1, reply = rf.doAppendEntries(args.LogEntries, currTerm, args.PrevLogIndex, args.PrevLogTerm)
+	if needPersist || needPersist1 {
+		rf.persist()
+	}
+
 	return reply
 }
 
-func (rf *Raft) receiveHeartbeat(term, myTerm int32, leader int) {
+func (rf *Raft) receiveHeartbeat(term, myTerm int32, leader int) (needPersist bool) {
 	rf.heartbeatTime.Store(time.Now().UnixMilli())
 
 	if rf.electionStartTime.Swap(0) > 0 {
 		rf.printf("receive AppendEntries from %v when election, stop election", leader)
 	}
+	needPersist = false
 	if term > myTerm {
 		rf.currentTerm.Store(term)
 		// we can reset votedFor only when term change
@@ -793,18 +834,18 @@ func (rf *Raft) receiveHeartbeat(term, myTerm int32, leader int) {
 		// and in term 50, we will have 2 leader
 		rf.votedFor = -1
 
-		rf.persist()
+		needPersist = true
 	}
 	rf.isLeader.Store(false)
+	return needPersist
 }
 
 func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32,
-	prevLogIndex int, prevLogTerm int32) *AppendEntriesReply {
+	prevLogIndex int, prevLogTerm int32) (bool, *AppendEntriesReply) {
 	reply := AppendEntriesReply{
 		Term: currTerm,
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	snapshotEndIndex := rf.snapshotEndIndex
 	if prevLogIndex == -1 {
 		rf.printf("Append all entries in term %v", currTerm)
@@ -814,12 +855,17 @@ func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32,
 		count := rf.lastAppliedIdx - snapshotEndIndex
 		rf.logEntries = entries[len(entries)-count:]
 		reply.IsSuccess = true
-		rf.persistLocked()
-	} else if logLen := len(rf.logEntries) + snapshotEndIndex + 1; logLen <= prevLogIndex {
+		rf.mu.Unlock()
+		return true, &reply
+	}
+	needPersist := false
+	if logLen := len(rf.logEntries) + snapshotEndIndex + 1; logLen <= prevLogIndex {
+		rf.mu.Unlock()
 		rf.printf("prevLogIndex doesn't match")
 		reply.IsSuccess = false
 		reply.XLogLen = logLen
 	} else if len(entries)+prevLogIndex <= snapshotEndIndex {
+		rf.mu.Unlock()
 		rf.printf("receive %v entries, prevLogIndex %v that is already in snapshot (snapshotEndIdx %v), ignore",
 			len(entries), prevLogIndex, snapshotEndIndex)
 		reply.IsSuccess = true
@@ -843,7 +889,9 @@ func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32,
 			for xIndex = realPrevLogIndex; xIndex >= 0 && rf.logEntries[xIndex].Term == myPrevLogTerm; xIndex-- {
 			}
 			reply.XIndex = xIndex + 1 + snapshotEndIndex + 1
+			rf.mu.Unlock()
 		} else if len(entries) == 0 {
+			rf.mu.Unlock()
 			reply.IsSuccess = true
 		} else {
 			if realPrevLogIndex >= 0 {
@@ -858,11 +906,12 @@ func (rf *Raft) doAppendEntries(entries []LogData, currTerm int32,
 				count := rf.lastAppliedIdx - snapshotEndIndex
 				rf.logEntries = entries[len(entries)-count:]
 			}
+			rf.mu.Unlock()
 			reply.IsSuccess = true
-			rf.persistLocked()
+			needPersist = true
 		}
 	}
-	return &reply
+	return needPersist, &reply
 }
 
 func (rf *Raft) workRunElection(lastLogIndex int, lastLogTerm int32, term int32) {
@@ -955,6 +1004,7 @@ func (rf *Raft) leaderStartCommand(command interface{}) []int {
 		rf.matchIndex[rf.me] = cmdIdx
 		rf.persistLocked()
 		rf.mu.Unlock()
+		rf.triggerAppendEntriesCh <- "start command"
 		return []int{cmdIdx, int(term), 1}
 	}
 	return []int{-1, int(term), 0}
@@ -962,8 +1012,16 @@ func (rf *Raft) leaderStartCommand(command interface{}) []int {
 
 func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 	heartbeatChan chan int, currTerm int32) {
-	if appendEntriesId < rf.lastAppendEntriesId.Load() || currTerm != rf.currentTerm.Load() {
-		// there's more recent run
+	latestAppendEntriesId := rf.lastAppendEntriesId.Load()
+	if appendEntriesId < latestAppendEntriesId {
+		rf.printf("skip appendEntriesToFollower to %v, old id %v (latest id %v)",
+			peer, appendEntriesId, latestAppendEntriesId)
+		return
+	}
+	latestTerm := rf.currentTerm.Load()
+	if currTerm != latestTerm {
+		rf.printf("skip appendEntriesToFollower to %v, old term %v (latest term %v)",
+			peer, currTerm, latestTerm)
 		return
 	}
 
@@ -995,7 +1053,7 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 		prevLogTerm = rf.snapshotEndTerm
 	}
 	if nextLogIndex <= lastLogIndex {
-		args.LogEntries = rf.logEntries[nextLogIndex:]
+		args.LogEntries = cloneEntries(rf.logEntries[nextLogIndex:])
 	}
 	rf.mu.Unlock()
 	args.PrevLogIndex = prevIndex
@@ -1010,36 +1068,41 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 	reply := AppendEntriesReply{}
 
 	ok := rf.peers[peer].Call("Raft.AppendEntries", &args, &reply)
-	if ok {
-		if heartbeatChan != nil {
-			heartbeatChan <- peer
-		}
-		if reply.IsSuccess {
-			appendEntries := args.LogEntries
-			if len(appendEntries) > 0 {
-				rf.printf("Success AppendEntries to %v in term %v, id %v, match index: %v",
-					peer, currTerm, appendEntriesId, len(appendEntries)+nextIndex-1)
-				rf.mu.Lock()
-				rf.nextIndex[peer] = nextIndex + len(appendEntries)
-				rf.matchIndex[peer] = nextIndex + len(appendEntries) - 1
-				rf.mu.Unlock()
-			}
-		} else {
-			if currTerm < reply.Term {
-				rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to new term in peer",
-					peer, currTerm, appendEntriesId)
-				rf.works <- work{
-					workType: WorkType_ToFollower,
-				}
-			} else {
-				rf.handleAppendEntriesConflict(&reply, peer, nextIndex, currTerm, appendEntriesId)
-				rf.appendEntriesToFollower(peer, appendEntriesId, nil, currTerm)
-			}
-		}
-	} else {
+	if !ok {
 		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to timeout",
 			peer, currTerm, appendEntriesId)
+		return
 	}
+	if heartbeatChan != nil {
+		heartbeatChan <- peer
+	}
+	if reply.IsSuccess {
+		appendEntries := args.LogEntries
+		if len(appendEntries) > 0 {
+			newNextIdx := nextIndex + len(appendEntries)
+			newMatchIdx := newNextIdx - 1
+			rf.printf("Success AppendEntries to %v in term %v, id %v, match index: %v",
+				peer, currTerm, appendEntriesId, newMatchIdx)
+			rf.mu.Lock()
+			rf.nextIndex[peer] = newNextIdx
+			rf.matchIndex[peer] = newMatchIdx
+			rf.mu.Unlock()
+			if len(appendEntries) > 0 {
+				rf.triggerUpdateCommitIdxCh <- struct{}{}
+			}
+		}
+		return
+	}
+	if currTerm < reply.Term {
+		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to new term in peer",
+			peer, currTerm, appendEntriesId)
+		rf.works <- work{
+			workType: WorkType_ToFollower,
+		}
+		return
+	}
+	rf.handleAppendEntriesConflict(&reply, peer, nextIndex, currTerm, appendEntriesId)
+	rf.appendEntriesToFollower(peer, appendEntriesId, nil, currTerm)
 }
 
 func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer, currNextIndex int, currTerm, appendEntriesId int32) {

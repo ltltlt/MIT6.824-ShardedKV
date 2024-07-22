@@ -7,6 +7,8 @@ type InstallSnapshotRequest struct {
 	LastIncludedTerm  int32
 	Offset            int
 	Data              []byte
+
+	AppendEntriesId int32
 }
 
 type InstallSnapshotReply struct {
@@ -21,15 +23,30 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 			req.LeaderId, req.Term, term)
 		return
 	}
-	rf.receiveHeartbeat(req.Term, term, req.LeaderId)
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if req.Term == term && req.AppendEntriesId < rf.receiveAppendEntriesId {
+		rf.printf("receive old AppendEntries from %v for appendEntriesId %v, latest id %v, ignore...",
+			req.LeaderId, req.AppendEntriesId, rf.receiveAppendEntriesId)
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.receiveAppendEntriesId = req.AppendEntriesId
+
+	needPersist := rf.receiveHeartbeat(req.Term, term, req.LeaderId)
+
+	defer func() {
+		if needPersist {
+			rf.persist()
+		}
+	}()
 
 	snapshotEndIdx := rf.snapshotEndIndex
 	if req.LastIncludedIndex <= snapshotEndIdx {
 		rf.printf("the snapshot from leader %v is shorter than mine (%v vs %v), ignore",
 			req.LeaderId, req.LastIncludedIndex, snapshotEndIdx)
+		rf.mu.Unlock()
 		return
 	}
 	rf.snapshot = req.Data
@@ -46,10 +63,19 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 		count := rf.lastAppliedIdx - req.LastIncludedIndex
 		rf.logEntries = rf.logEntries[len(rf.logEntries)-count:]
 	}
+	if req.LastIncludedIndex >= int(rf.commitIdx.Load()) {
+		// 2 conditions match so we can update commitIdx
+		// 1. we have receive those entries
+		// 2. leader must already commit those entries (snapshot only on committed entries)
+		rf.commitIdx.Store(int32(req.LastIncludedIndex))
+	}
 	rf.printf("InstallSnapshot from %v, lastAppliedIdx %v => %v, snapshotEndIndex %v => %v, snapshotEndTerm %v => %v",
 		req.LeaderId, oldLastAppliedIdx, rf.lastAppliedIdx,
 		snapshotEndIdx, rf.snapshotEndIndex, oldSnapshotEndTerm, req.LastIncludedTerm)
-	rf.persistLocked()
+	rf.mu.Unlock()
+
+	rf.updateApplyCh <- struct{}{}
+	needPersist = true
 }
 
 func (rf *Raft) sendInstallSnapshotToFollower(peer int, currTerm, appendEntriesId int32, heatbeatChan chan int) {
@@ -62,29 +88,36 @@ func (rf *Raft) sendInstallSnapshotToFollower(peer int, currTerm, appendEntriesI
 		LastIncludedTerm:  rf.snapshotEndTerm,
 		Offset:            0, // always send full snapshot
 		Data:              rf.snapshot,
+		AppendEntriesId:   appendEntriesId,
 	}
 	rf.mu.Unlock()
 	var reply InstallSnapshotReply
-	if rf.peers[peer].Call("Raft.InstallSnapshot", req, &reply) {
-		if reply.Term > currTerm {
-			rf.printf("current term %v, receive higher term %v from %v, change to follower", currTerm, reply.Term, peer)
-			rf.works <- work{
-				workType: WorkType_ToFollower,
-			}
-		} else {
-			rf.printf("success to InstallSnapshot to %v, lastIncludedTerm %v, lastIncludeIndex %v",
-				peer, req.LastIncludedTerm, req.LastIncludedIndex)
-			rf.mu.Lock()
-			rf.matchIndex[peer] = req.LastIncludedIndex
-			rf.nextIndex[peer] = req.LastIncludedIndex + 1
-			rf.mu.Unlock()
-			if heatbeatChan != nil {
-				heatbeatChan <- peer
-			}
-		}
-	} else {
+	if !rf.peers[peer].Call("Raft.InstallSnapshot", req, &reply) {
 		rf.printf("failed to rpc InstallSnapshot to %v", peer)
+		return
 	}
+	if reply.Term > currTerm {
+		rf.printf("current term %v, receive higher term %v from %v, change to follower", currTerm, reply.Term, peer)
+		rf.works <- work{
+			workType: WorkType_ToFollower,
+		}
+		return
+	}
+	rf.printf("success to InstallSnapshot to %v, lastIncludedTerm %v, lastIncludeIndex %v",
+		peer, req.LastIncludedTerm, req.LastIncludedIndex)
+	rf.mu.Lock()
+	rf.matchIndex[peer] = req.LastIncludedIndex
+	rf.nextIndex[peer] = req.LastIncludedIndex + 1
+	lastAppliedIdx := rf.lastAppliedIdx
+	rf.mu.Unlock()
+	if heatbeatChan != nil {
+		heatbeatChan <- peer
+	}
+
+	if req.LastIncludedIndex < lastAppliedIdx {
+		rf.appendEntriesToFollower(peer, appendEntriesId, nil, currTerm)
+	}
+	rf.triggerUpdateCommitIdxCh <- struct{}{}
 }
 
 // the service says it has created a snapshot that has
@@ -95,11 +128,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	index-- // raft is 1 based index, while internally we use 0 based index, so we need to shift
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if index <= rf.snapshotEndIndex {
 		rf.printf("try to Snapshot %v shorter than previous snapshot %v, ignore...", index, rf.snapshotEndIndex)
+		rf.mu.Unlock()
 		return
 	}
+	rf.printf("create new snapshot, endIdx %v", index)
 	logIdx := index - rf.snapshotEndIndex - 1
 	rf.snapshotEndTerm = rf.logEntries[logIdx].Term
 	count := rf.lastAppliedIdx - index // [index+1 ~ lastApplied]
@@ -113,4 +147,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshot = snapshot
 
 	rf.persistLocked()
+	rf.mu.Unlock()
+
+	rf.updateApplyCh <- struct{}{}
 }
