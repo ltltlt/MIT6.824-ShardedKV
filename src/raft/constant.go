@@ -8,3 +8,7 @@ const (
 	appendEntriesTimeOut  = time.Millisecond * 500
 	appendEntriesInterval = time.Millisecond * 150
 )
+
+const (
+	RejectAppendEntries_OldId int16 = 1
+)

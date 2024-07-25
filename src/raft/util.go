@@ -76,3 +76,10 @@ func cloneEntries(entries []LogData) []LogData {
 	copy(x, entries)
 	return x
 }
+
+func (rf *Raft) triggerAppendEntriesNoBlock(reason string) {
+	select {
+	case rf.triggerAppendEntriesCh <- reason:
+	default:
+	}
+}

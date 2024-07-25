@@ -34,7 +34,7 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 
 	rf.receiveAppendEntriesId = req.AppendEntriesId
 
-	needPersist := rf.receiveHeartbeat(req.Term, term, req.LeaderId)
+	needPersist := rf.receiveHeartbeatLocked(req.Term, term, req.LeaderId)
 
 	defer func() {
 		if needPersist {
@@ -98,9 +98,7 @@ func (rf *Raft) sendInstallSnapshotToFollower(peer int, currTerm, appendEntriesI
 	}
 	if reply.Term > currTerm {
 		rf.printf("current term %v, receive higher term %v from %v, change to follower", currTerm, reply.Term, peer)
-		rf.works <- work{
-			workType: WorkType_ToFollower,
-		}
+		rf.setFollower()
 		return
 	}
 	rf.printf("success to InstallSnapshot to %v, lastIncludedTerm %v, lastIncludeIndex %v",
