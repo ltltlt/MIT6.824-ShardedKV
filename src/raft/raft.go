@@ -217,16 +217,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) runRequestVote(args *RequestVoteArgs) *RequestVoteReply {
-	currTerm := rf.currentTerm.Load()
-	rf.printf("Run RequestVote in term %v, from %v in term %v", currTerm, args.CandidateId, args.Term)
-	if args.Term < currTerm {
-		rf.printf("RequestVote from node %v, term %v is older than my term %v, reject",
-			args.CandidateId, args.Term, currTerm)
-		return &RequestVoteReply{
-			VoteGranted: false,
-			Term:        currTerm,
-		}
-	}
 	runPersist := false
 	defer func() {
 		if runPersist {
@@ -234,6 +224,19 @@ func (rf *Raft) runRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		}
 	}()
 	rf.mu.Lock()
+
+	currTerm := rf.currentTerm.Load()
+	rf.printf("Run RequestVote in term %v, from %v in term %v", currTerm, args.CandidateId, args.Term)
+	if args.Term < currTerm {
+		rf.mu.Unlock()
+		rf.printf("RequestVote from node %v, term %v is older than my term %v, reject",
+			args.CandidateId, args.Term, currTerm)
+		return &RequestVoteReply{
+			VoteGranted: false,
+			Term:        currTerm,
+		}
+	}
+
 	if args.Term > currTerm {
 		// reset votedFor for new term (might caused by vote split), to ensure new term leader election can elect a leader
 		rf.votedFor = -1
@@ -350,9 +353,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	term := rf.currentTerm.Load()
 	if rf.isLeader.Load() {
 		rf.mu.Lock()
+		term := rf.currentTerm.Load()
 		cmdIdx := len(rf.logEntries) + rf.snapshotEndIndex + 1
 		rf.lastAppliedIdx = cmdIdx
 		rf.logEntries = append(rf.logEntries, LogData{
@@ -373,7 +376,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.printf("StartCommand result, cmdIdx %v, term %v, isLeader true", cmdIdx, term)
 		return cmdIdx + 1, int(term), true
 	}
-	return -1, int(term), false
+	return -1, int(rf.currentTerm.Load()), false
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -444,8 +447,17 @@ L:
 	}
 }
 
-func (rf *Raft) setLeader() {
+func (rf *Raft) setLeader(leaderTerm int32) {
 	rf.mu.Lock()
+	currTerm := rf.currentTerm.Load()
+
+	// we might receive higher term before setLeader but after election
+	// so we need to double check to make sure the term matches before we actually setLeader
+	if leaderTerm != currTerm {
+		rf.mu.Unlock()
+		rf.printf("receive higher term %v while setLeader for term %v, won't set leader", currTerm, leaderTerm)
+		return
+	}
 	rf.electionStartTime.Store(0)
 	rf.isLeader.Store(true)
 	lastAppliedIdx := len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
@@ -457,9 +469,7 @@ func (rf *Raft) setLeader() {
 	term := rf.currentTerm.Load()
 	rf.mu.Unlock()
 
-	rf.printf("become leader since term %v, lastAppliedIdx: %v", term, lastAppliedIdx)
-
-	rf.triggerAppendEntriesNoBlock("BecomeLeader")
+	rf.printf("become leader since term %v, lastAppliedIdx: %v", leaderTerm, lastAppliedIdx)
 }
 
 type AppendEntriesArgs struct {
@@ -540,17 +550,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) runElection() {
-	electionStartTime := rf.electionStartTime.Load()
-	if electionStartTime > 0 {
-		rf.printf("detect timeout %v, while election is ongoing, startTime %v...",
-			time.UnixMilli(rf.heartbeatTime.Load()).Format(time.StampMilli),
-			time.UnixMilli(electionStartTime).Format(time.StampMilli))
+	now := time.Now()
+	if !rf.electionStartTime.CompareAndSwap(0, now.UnixMilli()) {
+		rf.printf("detect timeout %v, while election is ongoing...",
+			time.UnixMilli(rf.heartbeatTime.Load()).Format(time.StampMilli))
 		return
 	}
 	// start new election
 
 	// reset timeout to avoid run election in every ticker
-	now := time.Now()
 	rf.heartbeatTime.Store(now.UnixMilli())
 	// we should set votefor to me
 	// if not, we might still vote for someone else in old term and causes me cannot win (only 3 of 5 nodes are alive case)
@@ -560,16 +568,15 @@ func (rf *Raft) runElection() {
 	rf.persistLocked()
 	rf.printf("detect timeout %v, start election in new term %v...",
 		now.Format(time.StampMilli), newTerm)
-	rf.electionStartTime.Store(time.Now().UnixMilli())
 	lastLogTerm := int32(-1)
 	lastLogIdx := len(rf.logEntries) - 1
 	snapshotEndIdx := rf.snapshotEndIndex
 	if lastLogIdx >= 0 {
 		lastLogTerm = rf.logEntries[lastLogIdx].Term
-		lastLogIdx += int(snapshotEndIdx) + 1
+		lastLogIdx += snapshotEndIdx + 1
 	} else if snapshotEndIdx >= 0 {
 		lastLogTerm = rf.snapshotEndTerm
-		lastLogIdx = int(snapshotEndIdx)
+		lastLogIdx = snapshotEndIdx
 	}
 	rf.mu.Unlock()
 
@@ -679,7 +686,6 @@ func (rf *Raft) goSendCommittedToApplyCh(applyCh chan ApplyMsg) {
 				SnapshotIndex: int(newSnapshotEndIndex) + 1,
 				SnapshotTerm:  int(rf.snapshotEndTerm),
 			})
-			// need to reset this
 			lastSendToChanIdx = newSnapshotEndIndex
 		}
 
@@ -753,19 +759,25 @@ func (rf *Raft) followerAppendEntries(args *AppendEntriesArgs) *AppendEntriesRep
 
 	rf.receiveAppendEntriesId = args.AppendEntriesId
 
-	rf.printf("receive AppendEntries (entries: %v) from %v for term %v, id %v, leaderCommitIdx: %v, lastAppliedIdx %v",
-		len(args.LogEntries), args.Leader, args.Term, args.AppendEntriesId, args.LeaderCommitIdx, lastAppliedIdx)
+	rf.printf("receive AppendEntries (entries: %v) from %v for term %v, id %v, leaderCommitIdx: %v, lastAppliedIdx %v, prevLogIdx %v",
+		len(args.LogEntries), args.Leader, args.Term, args.AppendEntriesId, args.LeaderCommitIdx, lastAppliedIdx, args.PrevLogIndex)
 
 	needPersist := rf.receiveHeartbeatLocked(args.Term, currTerm, args.Leader)
 
-	var needPersist1 bool
-	needPersist1, reply = rf.doAppendEntriesLocked(args.LogEntries, currTerm, args.PrevLogIndex, args.PrevLogTerm)
-	if needPersist || needPersist1 {
+	var appendSuccess bool
+	appendSuccess, reply = rf.doAppendEntriesLocked(args.LogEntries, currTerm, args.PrevLogIndex, args.PrevLogTerm)
+	if needPersist || appendSuccess {
 		rf.persistLocked()
 	}
 
 	// update commitIdx after appendEntries, just in case our log is shorten
-	rf.checkAndUpdateCommitIdxLocked(args.LeaderCommitIdx, args.Term)
+	if reply.IsSuccess {
+		// if not success, that must be caused by conflict, which means our log is divert with leader, and since
+		// we might have long log and leader might update entries to other followers and update commitIdx
+		// we might falsely commit some logs that we are not aligned with leader
+		// in this case, we shouldn't update commit index
+		rf.checkAndUpdateCommitIdxLocked(args.LeaderCommitIdx, args.Term)
+	}
 
 	rf.mu.Unlock()
 
@@ -823,8 +835,8 @@ func (rf *Raft) receiveHeartbeatLocked(term, myTerm int32, leader int) (needPers
 }
 
 func (rf *Raft) doAppendEntriesLocked(entries []LogData, currTerm int32,
-	prevLogIndex int, prevLogTerm int32) (bool, *AppendEntriesReply) {
-	reply := AppendEntriesReply{
+	prevLogIndex int, prevLogTerm int32) (appendSuccess bool, reply *AppendEntriesReply) {
+	reply = &AppendEntriesReply{
 		Term: currTerm,
 	}
 	snapshotEndIndex := rf.snapshotEndIndex
@@ -836,9 +848,9 @@ func (rf *Raft) doAppendEntriesLocked(entries []LogData, currTerm int32,
 		count := rf.lastAppliedIdx - snapshotEndIndex
 		rf.logEntries = entries[len(entries)-count:]
 		reply.IsSuccess = true
-		return true, &reply
+		return true, reply
 	}
-	needPersist := false
+	appendSuccess = false
 	if logLen := len(rf.logEntries) + snapshotEndIndex + 1; logLen <= prevLogIndex {
 		rf.printf("prevLogIndex doesn't match")
 		reply.IsSuccess = false
@@ -875,6 +887,8 @@ func (rf *Raft) doAppendEntriesLocked(entries []LogData, currTerm int32,
 				// need to keep current 100 (0) + entries
 				rf.logEntries = append(rf.logEntries[:realPrevLogIndex+1], entries...)
 				rf.lastAppliedIdx = len(rf.logEntries) - 1 + snapshotEndIndex + 1
+				rf.printf("receive %v entries, term %v, prevLogIdx %v, after appended entries %v",
+					len(entries), currTerm, realPrevLogIndex, len(rf.logEntries))
 			} else {
 				// prevLogIndex 100, entries [0~59]([101~160]), snapshotEndIndex 150
 				// only need to append (50~59)[151~160]
@@ -883,10 +897,10 @@ func (rf *Raft) doAppendEntriesLocked(entries []LogData, currTerm int32,
 				rf.logEntries = entries[len(entries)-count:]
 			}
 			reply.IsSuccess = true
-			needPersist = true
+			appendSuccess = true
 		}
 	}
-	return needPersist, &reply
+	return appendSuccess, reply
 }
 
 func (rf *Raft) leaderRequestVotes(lastLogIndex int, lastLogTerm int32, currTerm int32) {
@@ -951,8 +965,8 @@ L:
 		return
 	}
 	if voteCount >= targetVoteCount {
-		rf.printf("receive vote from %v, will become leader", voters)
-		rf.setLeader()
+		rf.printf("receive vote from %v in term %v, will become leader", voters, currTerm)
+		rf.setLeader(currTerm)
 		return
 	}
 
@@ -1060,7 +1074,8 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 	rf.appendEntriesToFollower(peer, appendEntriesId, nil, currTerm)
 }
 
-func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer, currNextIndex int, currTerm, appendEntriesId int32) {
+func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer int, currTerm, appendEntriesId int32) {
+	currNextIndex := rf.nextIndex[peer]
 	if reply.XLogLen < currNextIndex {
 		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to follower log entries too short %v",
 			peer, currTerm, appendEntriesId, reply.XLogLen)
@@ -1070,8 +1085,8 @@ func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer, cur
 	} else {
 		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to conflict, xterm: %v, xindex: %v",
 			peer, currTerm, appendEntriesId, reply.XTerm, reply.XIndex)
-		rf.mu.Lock()
 		isUpdated := false
+		rf.mu.Lock()
 		for i := len(rf.logEntries) - 1; i >= 0; i-- {
 			// we have this term, so parts of this term should have replicate
 			// to peer but not us, so we don't have to reset all of that term
@@ -1081,6 +1096,7 @@ func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer, cur
 					rf.printf("for peer %v and xterm %v, we already have this term in %v",
 						peer, reply.XTerm, i)
 					isUpdated = true
+					// start by the end of this term, as logs added in one term must be identical
 					rf.nextIndex[peer] = i + 1
 				}
 				break

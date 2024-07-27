@@ -3,10 +3,16 @@ package raft
 import (
 	"fmt"
 	"log"
+	"os"
 )
 
 // Debugging
 const Debug = false
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.SetOutput(os.Stdout)
+}
 
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
