@@ -72,9 +72,11 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 	rf.printf("InstallSnapshot from %v, lastAppliedIdx %v => %v, snapshotEndIndex %v => %v, snapshotEndTerm %v => %v",
 		req.LeaderId, oldLastAppliedIdx, rf.lastAppliedIdx,
 		snapshotEndIdx, rf.snapshotEndIndex, oldSnapshotEndTerm, req.LastIncludedTerm)
+
+	rf.updateApplyChSignals++
+	rf.updateApplyChCond.Signal()
 	rf.mu.Unlock()
 
-	rf.updateApplyCh <- struct{}{}
 	needPersist = true
 }
 
@@ -98,7 +100,7 @@ func (rf *Raft) sendInstallSnapshotToFollower(peer int, currTerm, appendEntriesI
 	}
 	if reply.Term > currTerm {
 		rf.printf("current term %v, receive higher term %v from %v, change to follower", currTerm, reply.Term, peer)
-		rf.setFollower()
+		rf.state.Store(StateFollower)
 		return
 	}
 	rf.printf("success to InstallSnapshot to %v, lastIncludedTerm %v, lastIncludeIndex %v",
@@ -115,7 +117,10 @@ func (rf *Raft) sendInstallSnapshotToFollower(peer int, currTerm, appendEntriesI
 	if req.LastIncludedIndex < lastAppliedIdx {
 		rf.appendEntriesToFollower(peer, appendEntriesId, nil, currTerm)
 	}
-	rf.triggerUpdateCommitIdxCh <- struct{}{}
+	rf.mu.Lock()
+	rf.updateCommitIdxSignals++
+	rf.updateCommitIdxCond.Signal()
+	rf.mu.Unlock()
 }
 
 // the service says it has created a snapshot that has
@@ -145,7 +150,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshot = snapshot
 
 	rf.persistLocked()
-	rf.mu.Unlock()
 
-	rf.updateApplyCh <- struct{}{}
+	rf.updateApplyChSignals++
+	rf.updateApplyChCond.Signal()
+	rf.mu.Unlock()
 }

@@ -83,9 +83,7 @@ func cloneEntries(entries []LogData) []LogData {
 	return x
 }
 
-func (rf *Raft) triggerAppendEntriesNoBlock(reason string) {
-	select {
-	case rf.triggerAppendEntriesCh <- reason:
-	default:
-	}
+func (rf *Raft) triggerAppendEntriesLocked(reason string) {
+	rf.appendEntriesReasons = append(rf.appendEntriesReasons, reason)
+	rf.appendEntriesCond.Signal()
 }
