@@ -102,8 +102,6 @@ type Raft struct {
 	updateApplyChSignals   int
 	updateCommitIdxSignals int
 	appendEntriesReasons   []string
-
-	leader int // can be wrong
 }
 
 type LogData struct {
@@ -437,7 +435,6 @@ func (rf *Raft) workSendAppendEntries(currTerm int32, appendEntriesId int32) {
 
 func (rf *Raft) setLeader(leaderTerm int32) {
 	rf.mu.Lock()
-	rf.leader = rf.me
 	currTerm := rf.currentTerm.Load()
 
 	// we might receive higher term before setLeader but after election
@@ -448,7 +445,6 @@ func (rf *Raft) setLeader(leaderTerm int32) {
 		return
 	}
 	if !rf.state.CompareAndSwap(StateCandidate, StateLeader) {
-		rf.leader = rf.me
 		rf.mu.Unlock()
 		rf.printf("Try to setLeader in non candidate state, ignore")
 		return
@@ -557,7 +553,6 @@ func (rf *Raft) runElection() {
 	// we should set votefor to me
 	// if not, we might still vote for someone else in old term and causes me cannot win (only 3 of 5 nodes are alive case)
 	rf.mu.Lock()
-	rf.leader = -1
 	rf.votedFor = rf.me
 	newTerm := rf.currentTerm.Add(1)
 	rf.persistLocked()
@@ -705,8 +700,8 @@ func (rf *Raft) goSendCommittedToApplyCh(applyCh chan ApplyMsg) {
 					break
 				}
 				if cmdLogIdx >= len(rf.logEntries) {
-					rf.printf("discrepancy in commitIdx %v, logEntries %v, lastApplied %v",
-						commitIdx, len(rf.logEntries), rf.lastAppliedIdx)
+					panic(fmt.Sprintf("[%v] discrepancy in commitIdx %v, logEntries %v, lastApplied %v, snapshotEndIdx %v",
+						rf.me, commitIdx, len(rf.logEntries), rf.lastAppliedIdx, rf.snapshotEndIndex))
 				}
 				command := rf.logEntries[cmdLogIdx]
 				messages = append(messages, ApplyMsg{
@@ -809,7 +804,6 @@ func (rf *Raft) checkAndUpdateCommitIdxLocked(leaderCommitIdx int32, leaderTerm 
 func (rf *Raft) receiveHeartbeatLocked(term, myTerm int32, leader int) (needPersist bool) {
 	rf.heartbeatTime.Store(time.Now().UnixMilli())
 
-	rf.leader = leader
 	prevState := rf.state.Swap(StateFollower)
 	if prevState == StateCandidate {
 		rf.printf("receive AppendEntries from %v in candidate state, stop election", leader)
@@ -977,14 +971,20 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 	if rf.killed() {
 		return
 	}
+	// fix: make sure the check and set args in same lock statement
+	// if not, 95 perform check first, then 96 perform checks, then 96 might set args prior to 95
+	// and cause 96 have shorter log and lower commitIdx and finally causes follower commit index not increment monotonically
+	rf.mu.Lock()
 	latestAppendEntriesId := rf.lastAppendEntriesId.Load()
 	if appendEntriesId < latestAppendEntriesId {
+		rf.mu.Unlock()
 		rf.printf("skip appendEntriesToFollower to %v, old id %v (latest id %v)",
 			peer, appendEntriesId, latestAppendEntriesId)
 		return
 	}
 	latestTerm := rf.currentTerm.Load()
 	if currTerm != latestTerm {
+		rf.mu.Unlock()
 		rf.printf("skip appendEntriesToFollower to %v, old term %v (latest term %v)",
 			peer, currTerm, latestTerm)
 		return
@@ -996,7 +996,6 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 		LeaderCommitIdx: rf.commitIdx.Load(),
 		AppendEntriesId: appendEntriesId,
 	}
-	rf.mu.Lock()
 	lastLogIndex := len(rf.logEntries) - 1
 	nextIndex := rf.nextIndex[peer]
 	snapshotEndIndex := rf.snapshotEndIndex
@@ -1062,7 +1061,6 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 	if currTerm < reply.Term {
 		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to new term in peer, switch to follower state",
 			peer, currTerm, appendEntriesId)
-		rf.leader = -1
 		rf.state.Store(StateFollower)
 		return
 	}
@@ -1071,18 +1069,17 @@ func (rf *Raft) appendEntriesToFollower(peer int, appendEntriesId int32,
 }
 
 func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer int, currTerm, appendEntriesId int32) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	currNextIndex := rf.nextIndex[peer]
 	if reply.XLogLen < currNextIndex {
 		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to follower log entries too short %v",
 			peer, currTerm, appendEntriesId, reply.XLogLen)
-		rf.mu.Lock()
 		rf.nextIndex[peer] = reply.XLogLen
-		rf.mu.Unlock()
 	} else {
 		rf.printf("failed to AppendEntries to follower %v in term %v, id %v due to conflict, xterm: %v, xindex: %v",
 			peer, currTerm, appendEntriesId, reply.XTerm, reply.XIndex)
 		isUpdated := false
-		rf.mu.Lock()
 		for i := len(rf.logEntries) - 1; i >= 0; i-- {
 			// we have this term, so parts of this term should have replicate
 			// to peer but not us, so we don't have to reset all of that term
@@ -1102,7 +1099,6 @@ func (rf *Raft) handleAppendEntriesConflict(reply *AppendEntriesReply, peer int,
 			rf.printf("for peer %v and xterm %v, we don't have this term", peer, reply.XTerm)
 			rf.nextIndex[peer] = reply.XIndex
 		}
-		rf.mu.Unlock()
 	}
 }
 

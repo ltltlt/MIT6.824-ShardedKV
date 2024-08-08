@@ -21,8 +21,10 @@ func DPrintf(format string, a ...interface{}) {
 }
 
 func (rf *Raft) printf(format string, a ...interface{}) {
-	format = fmt.Sprintf("[%v]", rf.me) + format
-	log.Printf(format, a...)
+	if Debug {
+		format = fmt.Sprintf("[%v]", rf.me) + format
+		log.Printf(format, a...)
+	}
 }
 
 func min(a, b int) int {
