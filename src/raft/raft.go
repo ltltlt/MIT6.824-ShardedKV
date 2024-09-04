@@ -72,7 +72,7 @@ type Raft struct {
 
 	// volatile
 	commitIdx      atomic.Int32 // commit index at leader
-	lastAppliedIdx int          // index apply on this server, might not commit
+	lastAppliedIdx int          // last Send Entries to applyCh, always <= commitIndex
 
 	// volatile leader state
 	nextIndex  []int // next log entry send to followers
@@ -181,7 +181,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.logEntries = logEntries
 	rf.snapshotEndIndex = snapshotEndIndex - 1
 	rf.snapshotEndTerm = snapshotEndTerm - 1
-	rf.lastAppliedIdx = rf.snapshotEndIndex + len(logEntries)
+	rf.lastAppliedIdx = -1
 
 	if rf.snapshotEndIndex >= 0 || len(logEntries) > 0 {
 		rf.updateApplyChSignals++
@@ -341,7 +341,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Lock()
 		term := rf.currentTerm.Load()
 		cmdIdx := len(rf.logEntries) + rf.snapshotEndIndex + 1
-		rf.lastAppliedIdx = cmdIdx
 		rf.logEntries = append(rf.logEntries, LogData{
 			Command: command,
 			Term:    term,
@@ -449,16 +448,15 @@ func (rf *Raft) setLeader(leaderTerm int32) {
 		rf.printf("Try to setLeader in non candidate state, ignore")
 		return
 	}
-	lastAppliedIdx := len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
-	rf.lastAppliedIdx = lastAppliedIdx
+	totalLogLen := len(rf.logEntries) + rf.snapshotEndIndex + 1
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = rf.lastAppliedIdx + 1
+		rf.nextIndex[i] = totalLogLen
 		rf.matchIndex[i] = -1
 	}
 	rf.triggerAppendEntriesLocked("BecomeLeader")
 	rf.mu.Unlock()
 
-	rf.printf("become leader since term %v, lastAppliedIdx: %v", leaderTerm, lastAppliedIdx)
+	rf.printf("become leader since term %v, logLen: %v", leaderTerm, totalLogLen)
 }
 
 type AppendEntriesArgs struct {
@@ -647,7 +645,7 @@ func (rf *Raft) updateCommitIdxLocked() {
 
 func (rf *Raft) goSendCommittedToApplyCh(applyCh chan ApplyMsg) {
 	// send lastSendToChan ~ commitIdx to channel (lab requirement) and avoid blocking
-	lastSendToChanIdx := -1
+	lastAppliedIdx := -1
 	snapshotEndIndex := -1
 
 	for !rf.killed() {
@@ -679,15 +677,15 @@ func (rf *Raft) goSendCommittedToApplyCh(applyCh chan ApplyMsg) {
 				SnapshotIndex: int(newSnapshotEndIndex) + 1,
 				SnapshotTerm:  int(rf.snapshotEndTerm),
 			})
-			lastSendToChanIdx = newSnapshotEndIndex
+			lastAppliedIdx = newSnapshotEndIndex
 		}
 
-		if lastSendToChanIdx < commitIdx {
+		if lastAppliedIdx < commitIdx {
 			// make a copy to avoid send to channel took too long
-			start := lastSendToChanIdx + 1
-			for lastSendToChanIdx < commitIdx {
-				lastSendToChanIdx++
-				cmdIdx := lastSendToChanIdx
+			start := lastAppliedIdx + 1
+			for lastAppliedIdx < commitIdx {
+				lastAppliedIdx++
+				cmdIdx := lastAppliedIdx
 				cmdLogIdx := cmdIdx - 1 - newSnapshotEndIndex
 				if cmdLogIdx < 0 {
 					// tricky cases: commitIdx (65) < newSnapshotEndIdx (68), while oldSnapshotEndIdx (58) < commitIdx
@@ -695,13 +693,9 @@ func (rf *Raft) goSendCommittedToApplyCh(applyCh chan ApplyMsg) {
 					// so we cannot change myCommitIdx to 68
 					// in this case, we cannot find entries not commited since they already snapshoted,
 					// so we need to wait for commitIdx >= newSnapshotEndIdx
-					rf.printf("commitIdx (%v) < snapshotEndIdx (%v), lastAppliedIdx %v, we don't have entries to send to applyCh, need to wait for commitIdx update",
-						commitIdx, newSnapshotEndIndex, rf.lastAppliedIdx)
+					rf.printf("commitIdx (%v) < snapshotEndIdx (%v), logLen %v, we don't have entries to send to applyCh, need to wait for commitIdx update",
+						commitIdx, newSnapshotEndIndex, len(rf.logEntries))
 					break
-				}
-				if cmdLogIdx >= len(rf.logEntries) {
-					panic(fmt.Sprintf("[%v] discrepancy in commitIdx %v, logEntries %v, lastApplied %v, snapshotEndIdx %v",
-						rf.me, commitIdx, len(rf.logEntries), rf.lastAppliedIdx, rf.snapshotEndIndex))
 				}
 				command := rf.logEntries[cmdLogIdx]
 				messages = append(messages, ApplyMsg{
@@ -712,6 +706,7 @@ func (rf *Raft) goSendCommittedToApplyCh(applyCh chan ApplyMsg) {
 			}
 			rf.printf("Send [%v, %v] to applyCh", start, commitIdx)
 		}
+		rf.lastAppliedIdx = lastAppliedIdx // it's ok that lastAppliedIdx is not up-to-date with send operation, since this goroutine is the only one use it
 		rf.mu.Unlock()
 		for _, msg := range messages {
 			applyCh <- msg
@@ -734,7 +729,7 @@ func (rf *Raft) followerAppendEntries(args *AppendEntriesArgs) *AppendEntriesRep
 		}
 	}
 
-	lastAppliedIdx := rf.lastAppliedIdx
+	logLen := len(rf.logEntries)
 
 	// tricky part: need to make sure check receiveAppendEntriesId, appendEntries and updateCommitIdx happened in a tx
 	// or we might appendEntries using old data (leader issued long times ago) while updateCommitIdx (leader issued just now)
@@ -752,8 +747,8 @@ func (rf *Raft) followerAppendEntries(args *AppendEntriesArgs) *AppendEntriesRep
 
 	rf.receiveAppendEntriesId = args.AppendEntriesId
 
-	rf.printf("receive AppendEntries (entries: %v) from %v for term %v, id %v, leaderCommitIdx: %v, lastAppliedIdx %v, prevLogIdx %v",
-		len(args.LogEntries), args.Leader, args.Term, args.AppendEntriesId, args.LeaderCommitIdx, lastAppliedIdx, args.PrevLogIndex)
+	rf.printf("receive AppendEntries (entries: %v) from %v for term %v, id %v, leaderCommitIdx: %v, currLogLen %v, prevLogIdx %v",
+		len(args.LogEntries), args.Leader, args.Term, args.AppendEntriesId, args.LeaderCommitIdx, logLen, args.PrevLogIndex)
 
 	needPersist := rf.receiveHeartbeatLocked(args.Term, currTerm, args.Leader)
 
@@ -789,9 +784,10 @@ func (rf *Raft) checkAndUpdateCommitIdxLocked(leaderCommitIdx int32, leaderTerm 
 		if len(rf.logEntries) > 0 && rf.logEntries[len(rf.logEntries)-1].Term == leaderTerm {
 			// we don't commit on previous term, only when it's the latest term
 			// TODO: does this check necessary?
-			newCommitIdx = min32(leaderCommitIdx, int32(rf.lastAppliedIdx))
-			rf.printf("Follower update commitIdx to %v, lastAppliedIdx %v, leaderCommitIdx %v",
-				newCommitIdx, rf.lastAppliedIdx, leaderCommitIdx)
+			lastTotalLogIdx := len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
+			newCommitIdx = min32(leaderCommitIdx, int32(lastTotalLogIdx))
+			rf.printf("Follower update commitIdx to %v, logLen %v, leaderCommitIdx %v",
+				newCommitIdx, lastTotalLogIdx+1, leaderCommitIdx)
 			rf.commitIdx.Store(newCommitIdx)
 		}
 	}
@@ -835,10 +831,9 @@ func (rf *Raft) doAppendEntriesLocked(entries []LogData, currTerm int32,
 	snapshotEndIndex := rf.snapshotEndIndex
 	if prevLogIndex == -1 {
 		rf.printf("Append all entries in term %v", currTerm)
-		rf.lastAppliedIdx = len(entries) - 1
 		// in case we already take snapshot
 		// append 60 entries, [0] already in snapshot, we only need to append [1, 59]
-		count := rf.lastAppliedIdx - snapshotEndIndex
+		count := len(entries) - 1 - snapshotEndIndex
 		rf.logEntries = entries[len(entries)-count:]
 		reply.IsSuccess = true
 		return true, reply
@@ -879,14 +874,12 @@ func (rf *Raft) doAppendEntriesLocked(entries []LogData, currTerm int32,
 				// prevLogIndex 100, entries [0~59]([101~160]), snapshotEndIndex 99
 				// need to keep current 100 (0) + entries
 				rf.logEntries = append(rf.logEntries[:realPrevLogIndex+1], entries...)
-				rf.lastAppliedIdx = len(rf.logEntries) - 1 + snapshotEndIndex + 1
 				rf.printf("receive %v entries, term %v, prevLogIdx %v, after appended entries %v",
 					len(entries), currTerm, realPrevLogIndex, len(rf.logEntries))
 			} else {
 				// prevLogIndex 100, entries [0~59]([101~160]), snapshotEndIndex 150
 				// only need to append (50~59)[151~160]
-				rf.lastAppliedIdx = len(entries) + prevLogIndex
-				count := rf.lastAppliedIdx - snapshotEndIndex
+				count := len(entries) + prevLogIndex - snapshotEndIndex
 				rf.logEntries = entries[len(entries)-count:]
 			}
 			reply.IsSuccess = true

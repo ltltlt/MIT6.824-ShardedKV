@@ -50,17 +50,16 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 		return
 	}
 	rf.snapshot = req.Data
-	oldLastAppliedIdx := rf.lastAppliedIdx
+	oldLastLogIndex := len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
 	oldSnapshotEndTerm := rf.snapshotEndTerm
 
 	rf.snapshotEndTerm = req.LastIncludedTerm
 	rf.snapshotEndIndex = req.LastIncludedIndex
-	if req.LastIncludedIndex >= rf.lastAppliedIdx {
-		rf.lastAppliedIdx = req.LastIncludedIndex
+	if req.LastIncludedIndex >= oldLastLogIndex {
 		rf.logEntries = nil
 	} else {
 		// in this case, leader snapshot is longer than us, we need to trim some logEntries to match the snapshot
-		count := rf.lastAppliedIdx - req.LastIncludedIndex
+		count := oldLastLogIndex - req.LastIncludedIndex
 		rf.logEntries = rf.logEntries[len(rf.logEntries)-count:]
 	}
 	if req.LastIncludedIndex >= int(rf.commitIdx.Load()) {
@@ -69,8 +68,8 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 		// 2. leader must already commit those entries (snapshot only on committed entries)
 		rf.commitIdx.Store(int32(req.LastIncludedIndex))
 	}
-	rf.printf("InstallSnapshot from %v, lastAppliedIdx %v => %v, snapshotEndIndex %v => %v, snapshotEndTerm %v => %v",
-		req.LeaderId, oldLastAppliedIdx, rf.lastAppliedIdx,
+	rf.printf("InstallSnapshot from %v, totalLogLen %v => %v, snapshotEndIndex %v => %v, snapshotEndTerm %v => %v",
+		req.LeaderId, oldLastLogIndex+1, len(rf.logEntries)-1+rf.snapshotEndIndex+1,
 		snapshotEndIdx, rf.snapshotEndIndex, oldSnapshotEndTerm, req.LastIncludedTerm)
 
 	rf.updateApplyChSignals++
@@ -108,13 +107,13 @@ func (rf *Raft) sendInstallSnapshotToFollower(peer int, currTerm, appendEntriesI
 	rf.mu.Lock()
 	rf.matchIndex[peer] = req.LastIncludedIndex
 	rf.nextIndex[peer] = req.LastIncludedIndex + 1
-	lastAppliedIdx := rf.lastAppliedIdx
+	lastTotalLogIdx := len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
 	rf.mu.Unlock()
 	if heatbeatChan != nil {
 		heatbeatChan <- peer
 	}
 
-	if req.LastIncludedIndex < lastAppliedIdx {
+	if req.LastIncludedIndex < lastTotalLogIdx {
 		rf.appendEntriesToFollower(peer, appendEntriesId, nil, currTerm)
 	}
 	rf.mu.Lock()
@@ -139,7 +138,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.printf("create new snapshot, endIdx %v", index)
 	logIdx := index - rf.snapshotEndIndex - 1
 	rf.snapshotEndTerm = rf.logEntries[logIdx].Term
-	count := rf.lastAppliedIdx - index // [index+1 ~ lastApplied]
+	lastTotalLogIdx := len(rf.logEntries) - 1 + rf.snapshotEndIndex + 1
+	count := lastTotalLogIdx - index // [index+1 ~ lastTotalLogIdx]
 	if count <= 0 {
 		rf.logEntries = nil
 	} else {
