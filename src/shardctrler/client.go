@@ -4,14 +4,28 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"sync/atomic"
+)
 import "time"
 import "crypto/rand"
 import "math/big"
 
+var (
+	clerkId atomic.Int32
+)
+
+// Clerk is not thread safe (concurrent request might have unexpected result)
+// if need multiple thread access, create clerk for each thread
+// it's not thread safe because we maintain opId for each op
+// and server will ignore lower opId if it already see higher opId
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+
+	opId atomic.Int32
+	id   int32
 }
 
 func nrand() int64 {
@@ -25,13 +39,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.id = clerkId.Add(1)
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
+	args := &QueryArgs{
+		Num: num,
+
+		ClerkId: ck.id,
+		OpId:    ck.opId.Add(1),
+	}
 	// Your code here.
-	args.Num = num
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -46,9 +65,13 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
+	args := &JoinArgs{
+		Servers: servers,
+
+		ClerkId: ck.id,
+		OpId:    ck.opId.Add(1),
+	}
 	// Your code here.
-	args.Servers = servers
 
 	for {
 		// try each known server.
@@ -64,9 +87,13 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
+	args := &LeaveArgs{
+		GIDs: gids,
+
+		ClerkId: ck.id,
+		OpId:    ck.opId.Add(1),
+	}
 	// Your code here.
-	args.GIDs = gids
 
 	for {
 		// try each known server.
@@ -82,10 +109,14 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
+	args := &MoveArgs{
+		Shard: shard,
+		GID:   gid,
+
+		ClerkId: ck.id,
+		OpId:    ck.opId.Add(1),
+	}
 	// Your code here.
-	args.Shard = shard
-	args.GID = gid
 
 	for {
 		// try each known server.

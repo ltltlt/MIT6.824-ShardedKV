@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+// Op is raft log
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,

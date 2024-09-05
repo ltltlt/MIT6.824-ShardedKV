@@ -1,17 +1,25 @@
 package shardkv
 
-
-import "6.5840/labrpc"
+import (
+	"6.5840/labrpc"
+	"6.5840/shardctrler"
+	"sync/atomic"
+	"time"
+)
 import "6.5840/raft"
 import "sync"
 import "6.5840/labgob"
-
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	OpType  int8
+	Key     string
+	Value   string
+	OpId    int32
+	ClerkId int32
 }
 
 type ShardKV struct {
@@ -25,15 +33,56 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister           *raft.Persister
+	state               map[string]string
+	stateUpdateCond     *sync.Cond
+	latestAppliedCmdIdx int
+	maxOpIdForClerk     map[int32]int32 // used to avoid re-executing op
+
+	// we don't have to keep below in stable storage
+	// because when we restart the server, there's no longer old requests
+	neededCommandIdxes map[int]struct{}
+	commandIdx2Op      map[int]*Op // used to check whether the committed command is the same as we added
+
+	dead                    atomic.Bool
+	shards                  [shardctrler.NShards]bool // whether the shard is controlled by me
+	ctrlOpId                atomic.Int32
+	updateConfigTime        time.Time
+	updateConfigCond        *sync.Cond
+	triggerUpdateConfigCond *sync.Cond
+	updateConfigRequests    int
 }
 
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	if !kv.keyMatch(args.Key) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	reply.Err = kv.retryUntilCommit(NewGetOp(args))
+	if reply.Err == OK {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		v, ok := kv.state[args.Key]
+		if !ok {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Value = v
+		}
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	if !kv.keyMatch(args.Key) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	var op *Op
+	if args.Op == "Put" {
+		op = NewPutOp(args)
+	} else {
+		op = NewAppendOp(args)
+	}
+	reply.Err = kv.retryUntilCommit(op)
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -43,8 +92,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.dead.Store(true)
 }
-
 
 // servers[] contains the ports of the servers in this group.
 //
@@ -90,8 +139,27 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	if snapshot := persister.ReadSnapshot(); len(snapshot) > 0 {
+		if err := kv.readSnapshotLocked(snapshot); err != nil {
+			panic(err)
+		}
+	} else {
+		kv.state = make(map[string]string)
+		kv.latestAppliedCmdIdx = 0
+		kv.maxOpIdForClerk = make(map[int32]int32)
+	}
+	kv.stateUpdateCond = sync.NewCond(&kv.mu)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.commandIdx2Op = make(map[int]*Op)
+	kv.neededCommandIdxes = make(map[int]struct{})
+	kv.persister = persister
+
+	kv.updateConfigCond = sync.NewCond(&kv.mu)
+	kv.triggerUpdateConfigCond = sync.NewCond(&kv.mu)
+
+	go kv.goUpdateStateFromApplyCh()
+	go kv.goUpdateConfig()
 
 	return kv
 }
