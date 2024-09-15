@@ -147,7 +147,7 @@ func (sc *ShardCtrler) applyOpLocked(op *Op) {
 		lastConfig := sc.configs[len(sc.configs)-1]
 		newConfig := Config{
 			Num:    lastConfig.Num + 1,
-			Groups: copyMap(lastConfig.Groups, op.Servers),
+			Groups: CopyMap(lastConfig.Groups, op.Servers),
 		}
 		var newGroups []int
 		for g := range op.Servers {
@@ -159,7 +159,7 @@ func (sc *ShardCtrler) applyOpLocked(op *Op) {
 		sc.configs = append(sc.configs, newConfig)
 	case OpLeave:
 		lastConfig := sc.configs[len(sc.configs)-1]
-		newGroups := copyMap(lastConfig.Groups)
+		newGroups := CopyMap(lastConfig.Groups)
 		for _, gid := range op.GIDs {
 			delete(newGroups, gid)
 		}
@@ -174,7 +174,7 @@ func (sc *ShardCtrler) applyOpLocked(op *Op) {
 		lastConfig := sc.configs[len(sc.configs)-1]
 		newConfig := Config{
 			Num:    lastConfig.Num + 1,
-			Groups: copyMap(lastConfig.Groups),
+			Groups: CopyMap(lastConfig.Groups),
 			Shards: lastConfig.Shards,
 		}
 		oldGID := newConfig.Shards[op.Shard]

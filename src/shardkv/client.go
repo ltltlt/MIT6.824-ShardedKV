@@ -84,9 +84,13 @@ func (ck *Clerk) Get(key string) string {
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
+				ck.dprintf("call get on %v", servers[si])
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+				if ok {
+					ck.dprintf("call get on %v, result %v", servers[si], reply.Err)
+				}
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
@@ -120,9 +124,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
+				ck.dprintf("call putappend (%v, %v) on %v", key, value, servers[si])
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				if ok {
+					ck.dprintf("call putappend (%v, %v) on %v, result %v", key, value, servers[si], reply.Err)
+				}
 				if ok && reply.Err == OK {
 					return
 				}

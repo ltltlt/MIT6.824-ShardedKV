@@ -34,7 +34,11 @@ type Config struct {
 }
 
 const (
-	OK    = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
+	ErrDead        = "ErrDead"
+	ErrTimeout     = "ErrTimeout"
+
 	Debug = true
 )
 
@@ -90,26 +94,20 @@ type QueryReply struct {
 	Config      Config
 }
 
-const (
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrDead        = "ErrDead"
-	ErrTimeout     = "ErrTimeout"
-)
-
 func (sc *ShardCtrler) dprintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		log.Println(fmt.Sprintf("[s%v]", sc.me) + fmt.Sprintf(format, a...))
+		log.Println(fmt.Sprintf("[cs%v]", sc.me) + fmt.Sprintf(format, a...))
 	}
 	return
 }
 func (ck *Clerk) dprintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
-		log.Println(fmt.Sprintf("[c%v]", ck.id) + fmt.Sprintf(format, a...))
+		log.Println(fmt.Sprintf("[cc%v]", ck.id) + fmt.Sprintf(format, a...))
 	}
 	return
 }
 
-func copyMap[K comparable, V any](maps ...map[K]V) map[K]V {
+func CopyMap[K comparable, V any](maps ...map[K]V) map[K]V {
 	newMap := make(map[K]V)
 	for _, m := range maps {
 		for k, v := range m {

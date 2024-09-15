@@ -1,14 +1,13 @@
 package shardkv
 
 import (
+	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/raft"
 	"6.5840/shardctrler"
+	"sync"
 	"sync/atomic"
-	"time"
 )
-import "6.5840/raft"
-import "sync"
-import "6.5840/labgob"
 
 type Op struct {
 	// Your definitions here.
@@ -20,6 +19,17 @@ type Op struct {
 	Value   string
 	OpId    int32
 	ClerkId int32
+
+	Timestamp       int64
+	Shard           int
+	ShardData       map[string]string
+	GID             int
+	Servers         []string
+	ConfigNum       int
+	MaxOpIdForClerk map[int32]int32
+
+	OldConfig shardctrler.Config
+	NewConfig shardctrler.Config
 }
 
 type ShardKV struct {
@@ -32,57 +42,81 @@ type ShardKV struct {
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
 	persister           *raft.Persister
-	state               map[string]string
+	states              [shardctrler.NShards]map[string]string
 	stateUpdateCond     *sync.Cond
 	latestAppliedCmdIdx int
-	maxOpIdForClerk     map[int32]int32 // used to avoid re-executing op
+	maxOpIdForClerks    [shardctrler.NShards]map[int32]int32 // used to avoid re-executing op
 
 	// we don't have to keep below in stable storage
 	// because when we restart the server, there's no longer old requests
 	neededCommandIdxes map[int]struct{}
 	commandIdx2Op      map[int]*Op // used to check whether the committed command is the same as we added
 
-	dead                    atomic.Bool
-	shards                  [shardctrler.NShards]bool // whether the shard is controlled by me
-	ctrlOpId                atomic.Int32
-	updateConfigTime        time.Time
+	dead atomic.Bool
+
+	clerkId               int32
+	opId                  atomic.Int32
+	moveShardId           int32
+	moveShardChan         chan *Op
+	moveShardCompleteChan chan struct{}
+
+	updateConfigTime        int64
 	updateConfigCond        *sync.Cond
 	triggerUpdateConfigCond *sync.Cond
 	updateConfigRequests    int
+
+	config        *shardctrler.Config
+	shards        []int      // shard => server
+	moveShardCond *sync.Cond // signals when moving 1 shard is completed
+
+	configs              map[int]*shardctrler.Config // cache so we don't have to query every time
+	putShardConfigNums   []int
+	shardStateUpdateCond *sync.Cond
+}
+
+type moveShardRequest struct {
+	configNum int
+	shard     int
+	servers   []string
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	if !kv.keyMatch(args.Key) {
-		reply.Err = ErrWrongGroup
-		return
-	}
-	reply.Err = kv.retryUntilCommit(NewGetOp(args))
+	shard := key2shard(args.Key)
+	kv.dprintf("receive Get, key %v, shard %v", args.Key, shard)
+	reply.Err = kv.retryUntilCommit(NewGetOp(args, shard), shard)
 	if reply.Err == OK {
+		shard := key2shard(args.Key)
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		v, ok := kv.state[args.Key]
-		if !ok {
+		state := kv.states[shard]
+		if state == nil {
 			reply.Err = ErrNoKey
 		} else {
-			reply.Value = v
+			v, ok := state[args.Key]
+			if !ok {
+				reply.Err = ErrNoKey
+			} else {
+				reply.Value = v
+			}
 		}
 	}
 }
 
+func (kv *ShardKV) PutShardData(args *PutShardDataArgs, reply *PutShardDataReply) {
+	reply.Err = kv.retryUntilCommit(NewPutShardOp(args), -1)
+	return
+}
+
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	if !kv.keyMatch(args.Key) {
-		reply.Err = ErrWrongGroup
-		return
-	}
+	shard := key2shard(args.Key)
 	var op *Op
 	if args.Op == "Put" {
-		op = NewPutOp(args)
+		op = NewPutOp(args, shard)
 	} else {
-		op = NewAppendOp(args)
+		op = NewAppendOp(args, shard)
 	}
-	reply.Err = kv.retryUntilCommit(op)
+	reply.Err = kv.retryUntilCommit(op, shard)
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -93,6 +127,10 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	kv.dead.Store(true)
+	kv.shardStateUpdateCond.Broadcast()
+	kv.stateUpdateCond.Broadcast()
+	kv.updateConfigCond.Broadcast()
+	kv.moveShardCond.Broadcast()
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -145,9 +183,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 			panic(err)
 		}
 	} else {
-		kv.state = make(map[string]string)
 		kv.latestAppliedCmdIdx = 0
-		kv.maxOpIdForClerk = make(map[int32]int32)
+		kv.shards = make([]int, shardctrler.NShards)
+		kv.putShardConfigNums = make([]int, shardctrler.NShards)
+		kv.config = &shardctrler.Config{Num: -1}
 	}
 	kv.stateUpdateCond = sync.NewCond(&kv.mu)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -158,8 +197,21 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.updateConfigCond = sync.NewCond(&kv.mu)
 	kv.triggerUpdateConfigCond = sync.NewCond(&kv.mu)
 
+	kv.moveShardCond = sync.NewCond(&kv.mu)
+	kv.configs = make(map[int]*shardctrler.Config)
+
+	kv.moveShardChan = make(chan *Op, 1)
+	kv.moveShardCompleteChan = make(chan struct{})
+
+	kv.clerkId = int32(kv.gid)*100 + int32(kv.me)
+	kv.updateConfigRequests++ // trigger on starting to pull latest config
+
+	kv.dprintf("start server")
+	kv.shardStateUpdateCond = sync.NewCond(&kv.mu)
+
 	go kv.goUpdateStateFromApplyCh()
 	go kv.goUpdateConfig()
+	go kv.goTriggerUpdateConfig()
 
 	return kv
 }

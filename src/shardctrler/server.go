@@ -1,12 +1,12 @@
 package shardctrler
 
 import (
+	"6.5840/labgob"
+	"6.5840/labrpc"
 	"6.5840/raft"
+	"sync"
 	"sync/atomic"
 )
-import "6.5840/labrpc"
-import "sync"
-import "6.5840/labgob"
 
 type ShardCtrler struct {
 	mu      sync.Mutex
