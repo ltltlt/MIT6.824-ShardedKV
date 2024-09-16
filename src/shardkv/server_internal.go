@@ -14,10 +14,7 @@ const (
 	OpPut
 	OpAppend
 
-	OpGetShard = iota + 10
-	OpDelShard
-	OpPutShard
-	OpMoveShard
+	OpPutShard = iota + 12
 	OpUpdateShardState
 
 	OpUpdateConfig = iota + 20
@@ -72,7 +69,8 @@ func (kv *ShardKV) goUpdateStateFromApplyCh() {
 				}
 				kv.stateUpdateCond.Broadcast()
 			} else {
-				kv.dprintf("Ignore snapshot endIdx %v, latest applied idx %v", msg.SnapshotIndex, kv.latestAppliedCmdIdx)
+				// snapshot contains less information than latestAppliedLog, we do nothing
+				//kv.dprintf("Ignore snapshot endIdx %v, latest applied idx %v", msg.SnapshotIndex, kv.latestAppliedCmdIdx)
 			}
 			kv.mu.Unlock()
 		}
@@ -83,14 +81,15 @@ func (kv *ShardKV) goUpdateStateFromApplyCh() {
 }
 
 func (kv *ShardKV) applyDataOpLocked(op *Op) Err {
-	shard := key2shard(op.Key)
+	detail := op.Data.(UpdateKeyOpData)
+	shard := key2shard(detail.Key)
 	if kv.shards[shard] == ShardFreeze {
 		return ErrWrongGroup
 	}
-	state := kv.states[shard]
+	state := kv.shardData[shard]
 	if state == nil {
 		state = make(map[string]string)
-		kv.states[shard] = state
+		kv.shardData[shard] = state
 	}
 	maxOpIdForClerk := kv.maxOpIdForClerks[shard]
 	if maxOpIdForClerk == nil {
@@ -106,9 +105,9 @@ func (kv *ShardKV) applyDataOpLocked(op *Op) Err {
 	kv.dprintf("apply data op %+v", op)
 	switch op.OpType {
 	case OpPut:
-		state[op.Key] = op.Value
+		state[detail.Key] = detail.Value
 	case OpAppend:
-		state[op.Key] += op.Value
+		state[detail.Key] += detail.Value
 	case OpGet:
 	}
 	return OK
@@ -116,116 +115,112 @@ func (kv *ShardKV) applyDataOpLocked(op *Op) Err {
 
 func (kv *ShardKV) applyOpLocked(op *Op) Err {
 	// only op from client needs to be dedupped
-	// other op are from servers, and hence won't cause duplicate
+	// other op are from servers, and won't cause duplicate
 	if op.OpType == OpPut || op.OpType == OpAppend || op.OpType == OpGet {
 		return kv.applyDataOpLocked(op)
 	}
 
-	if op.OpType != OpUpdateConfigTime {
-		kv.dprintf("apply op %+v", op)
-	}
+	kv.dprintf("apply op %+v", op)
 
 	switch op.OpType {
 	case OpPutShard:
 		// might receive from multiple replica
-		if op.ConfigNum > kv.putShardConfigNums[op.Shard] {
-			kv.putShardConfigNums[op.Shard] = op.ConfigNum
-			kv.states[op.Shard] = shardctrler.CopyMap(op.ShardData)
-			kv.maxOpIdForClerks[op.Shard] = shardctrler.CopyMap(op.MaxOpIdForClerk)
+		detail := op.Data.(PutShardOpData)
+		if detail.ConfigNum > kv.putShardConfigNums[op.Shard] {
+			kv.putShardConfigNums[op.Shard] = detail.ConfigNum
+			kv.shardData[op.Shard] = shardctrler.CopyMap(detail.ShardData)
+			kv.maxOpIdForClerks[op.Shard] = shardctrler.CopyMap(detail.MaxOpIdForClerk)
 			if kv.shards[op.Shard] == ShardWaitForPut {
 				kv.shards[op.Shard] = kv.gid
-				kv.moveShardCond.Broadcast()
+				kv.shardStateUpdateCond.Broadcast()
 			}
 		} else {
-			kv.dprintf("ignore putShard in configNum %v, seen configNum %v", op.ConfigNum, kv.putShardConfigNums[op.Shard])
+			kv.dprintf("ignore putShard in configNum %v, seen configNum %v", detail.ConfigNum, kv.putShardConfigNums[op.Shard])
 		}
 	case OpUpdateShardState:
-		kv.shards[op.Shard] = op.GID
+		detail := op.Data.(UpdateShardStateOpData)
+		kv.shards[op.Shard] = detail.GID
 		kv.shardStateUpdateCond.Broadcast()
-	case OpMoveShard:
-		kv.moveShardId++
 	case OpUpdateConfigTime:
-		kv.updateConfigTime = op.Timestamp
+		detail := op.Data.(UpdateConfigTimeOpData)
+		kv.updateConfigTimes[op.Shard] = detail.Timestamp
+		kv.updateConfigRequests[op.Shard] = 0
+		kv.updateConfigDoneCond.Broadcast()
 	case OpUpdateConfig:
-		kv.config = &op.NewConfig
-		kv.updateConfigTime = op.Timestamp
+		detail := op.Data.(UpdateConfigOpData)
+		kv.configNums[op.Shard] = detail.NewConfigNum
+		kv.updateConfigTimes[op.Shard] = detail.Timestamp
+		kv.shards[op.Shard] = detail.NewGID
 		// config is updated successfully, do the gabage collection
-		for shard, gid := range kv.config.Shards {
-			kv.shards[shard] = gid
-			if gid != kv.gid && kv.putShardConfigNums[shard] < kv.config.Num {
-				// we don't own this shard in the new config
-				// and we don't own it in the future (at least we don't know if we own it)
-				// if we own it in future config, we should not clear the shard data
-				kv.states[shard] = nil
-			}
+		if kv.shards[op.Shard] != kv.gid && kv.putShardConfigNums[op.Shard] < detail.NewConfigNum {
+			kv.shardData[op.Shard] = nil
 		}
+		// since we update the config, reset the request
+		kv.updateConfigRequests[op.Shard] = 0
+		kv.updateConfigDoneCond.Broadcast()
 	}
 	return OK
 }
 
-func (kv *ShardKV) update1Config(oldConfig *shardctrler.Config, newConfig *shardctrler.Config, ts int64) Err {
-	for shard, gid := range newConfig.Shards {
-		oldGID := oldConfig.Shards[shard]
-		if gid == oldGID {
-			// do nothing
-		} else if gid != kv.gid && oldGID != kv.gid {
-			// change shard but me is not involved
-		} else if gid == kv.gid {
-			// not me => me
-			if oldGID == 0 {
-				kv.mu.Lock()
-				kv.shards[shard] = gid // update shard state so this can be exposed
+func (kv *ShardKV) update1ConfigForShard(shard int, oldConfig *shardctrler.Config, newConfig *shardctrler.Config, ts int64) Err {
+	gid := newConfig.Shards[shard]
+	oldGID := oldConfig.Shards[shard]
+	kv.dprintf("try to update config for shard %v from %v (%v) => %v (%v)",
+		shard, oldConfig.Num, oldGID, newConfig.Num, gid)
+	if gid == oldGID {
+		// do nothing
+	} else if gid != kv.gid && oldGID != kv.gid {
+		// change shard but me is not involved
+	} else if gid == kv.gid {
+		// not me => me
+		if oldGID == 0 {
+			// from 0 to me, no shard movement
+		} else {
+			kv.mu.Lock()
+			if kv.putShardConfigNums[shard] < newConfig.Num {
+				kv.dprintf("update config from %v to %v blocking, wait for putShard for %v", oldConfig.Num, newConfig.Num, shard)
+				kv.shards[shard] = ShardWaitForPut
+				kv.waitShardPutLocked(shard, time.Minute*60) // it's ok for us to block forever
 				kv.mu.Unlock()
 			} else {
-				kv.mu.Lock()
-				if kv.putShardConfigNums[shard] < newConfig.Num {
-					kv.dprintf("update config from %v to %v blocking, wait for putShard for %v", oldConfig.Num, newConfig.Num, shard)
-					kv.shards[shard] = ShardWaitForPut
-					kv.waitShardPutLocked(shard)
-					kv.mu.Unlock()
-				} else {
-					// the shard is already put to me, so I don't have to wait
-					kv.shards[shard] = gid
-					kv.mu.Unlock()
-				}
+				// the shard is already put to me, so I don't have to wait
+				kv.shards[shard] = gid
+				kv.mu.Unlock()
 			}
-		} else {
-			// me => not me
-			// the shard must already been put in previous config change
-			// (it's blocking op, only we own the shard, then config change can proceed)
-			servers := newConfig.Groups[gid]
-			if servers == nil {
-				servers = oldConfig.Groups[gid]
-			}
-			kv.dprintf("freeze shard %v and move it to %v in config %v => %v", shard, gid, oldConfig.Num, newConfig.Num)
-			// make sure freeze shard and put/append operation happen in same order across raft replica
-			// or different replica might see different behaviors
-			if err := kv.waitShardFreeze(shard, oldGID, oldConfig.Num); err != OK {
-				// either config changed or we are dead
-				// either way, we restart config change process
-				kv.dprintf("cannot freeze shard %v, err %v", shard, err)
-				return err
-			}
-
-			// the move shard id is also replicated by raft to make sure only leader can change it monotonicly
-			// let raft control the move shard id
-			err := kv.retryUntilCommit(NewMoveShardOp(shard, gid, servers, newConfig.Num, -1, -1), -1)
-			if err != OK {
-				return err
-			}
-			kv.mu.Lock()
-			data := kv.states[shard] // after freeze, the data won't be modified
-			opId := kv.moveShardId   // use the replicated id since it increment monotonicly
-			maxOpIdForClerk := kv.maxOpIdForClerks[shard]
-			kv.mu.Unlock()
-			kv.moveShard(newConfig.Num, shard, data, servers, opId, maxOpIdForClerk)
 		}
+	} else {
+		// me => not me
+		// the shard must already been put in previous config change
+		// (it's blocking op, only we own the shard, then config change can proceed)
+		servers := newConfig.Groups[gid]
+		if servers == nil {
+			servers = oldConfig.Groups[gid]
+		}
+		kv.dprintf("freeze shard %v and move it to %v in config %v => %v", shard, gid, oldConfig.Num, newConfig.Num)
+		// make sure freeze shard and put/append operation happen in same order across raft replica
+		// or different replica might see different behaviors
+		if err := kv.waitShardFreeze(shard, oldGID, oldConfig.Num); err != OK {
+			// either config changed or we are dead
+			// either way, we restart config change process
+			kv.dprintf("cannot freeze shard %v, err %v", shard, err)
+			return err
+		}
+
+		kv.mu.Lock()
+		data := shardctrler.CopyMap(kv.shardData[shard]) // after freeze, the data might be modified by read snapshot
+		maxOpIdForClerk := shardctrler.CopyMap(kv.maxOpIdForClerks[shard])
+		kv.mu.Unlock()
+
+		kv.moveShard(newConfig.Num, shard, data, servers, maxOpIdForClerk)
 	}
+	kv.dprintf("success to move shard %v from %v (%v) => %v (%v), now commit the config change for the shard",
+		shard, oldConfig.Num, oldGID, newConfig.Num, gid)
 	// the shard movement is done, now we commit the change
 	// it's ok if we failed to commit before crash, we will do this again without any issue
-	err := kv.retryUntilCommit(NewUpdateConfigOp(oldConfig, newConfig, ts, kv.clerkId, kv.opId.Add(1)), -1)
+	op := NewUpdateConfigOp(shard, newConfig.Num, gid, ts, kv.clerkId, kv.opId.Add(1))
+	err := kv.retryUntilCommit(op, -1, time.Second*5) // we can block here forever, instead of start another one
 	if err != OK && err != ErrWrongLeader {
-		kv.dprintf("failed to update config after shard movement, err %v", err)
+		kv.dprintf("failed to update config for shard %v after shard movement, err %v", shard, err)
 	}
 	return err
 }
@@ -237,8 +232,8 @@ func (kv *ShardKV) waitShardFreeze(shard int, oldGID int, configNum int) Err {
 			kv.mu.Unlock()
 			return OK
 		}
-		if kv.shards[shard] != oldGID || kv.config.Num != configNum {
-			// states change, we must be no leader
+		if kv.shards[shard] != oldGID || kv.configNums[shard] != configNum {
+			// shardData change, we must be no leader
 			kv.mu.Unlock()
 			return ErrWrongLeader
 		}
@@ -246,7 +241,7 @@ func (kv *ShardKV) waitShardFreeze(shard int, oldGID int, configNum int) Err {
 		if !ok {
 			// wait for leader sync the op to me
 			kv.waitForCondWithTimeout(func() bool {
-				return kv.shards[shard] == ShardFreeze || kv.shards[shard] != oldGID || kv.config.Num != configNum
+				return kv.shards[shard] == ShardFreeze || kv.shards[shard] != oldGID || kv.configNums[shard] != configNum
 			}, kv.shardStateUpdateCond, time.Millisecond*100)
 			// if timeout, might be no leader we will try to start again
 			kv.mu.Unlock()
@@ -261,13 +256,19 @@ func (kv *ShardKV) waitShardFreeze(shard int, oldGID int, configNum int) Err {
 	return OK
 }
 
-func (kv *ShardKV) retryUntilCommit(op *Op, shard int) Err {
+func (kv *ShardKV) retryUntilCommit(op *Op, shard int, timeout time.Duration) Err {
 	for {
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			// fail fast, even though there's no leader now, the client can retry until leader found
+			return ErrWrongLeader
+		}
 		kv.mu.Lock()
 		if shard >= 0 {
-			if !kv.shardMatchLocked(shard) {
+			kv.dprintf("check shard %v match for op %+v", shard, op)
+			if err := kv.shardMatchLocked(shard, timeout); err != OK {
 				kv.mu.Unlock()
-				return ErrWrongGroup
+				return err
 			}
 			kv.dprintf("check shard %v match done", shard)
 		}
@@ -278,7 +279,7 @@ func (kv *ShardKV) retryUntilCommit(op *Op, shard int) Err {
 		}
 		kv.neededCommandIdxes[idx] = struct{}{}
 		kv.mu.Unlock()
-		err := kv.waitForCommandWithTimeout(idx, time.Millisecond*300)
+		err := kv.waitForCommandWithTimeout(idx, timeout)
 		if err != OK {
 			return err
 		}
@@ -302,32 +303,31 @@ func (kv *ShardKV) retryUntilCommit(op *Op, shard int) Err {
 	}
 }
 
-func (kv *ShardKV) waitForCommandWithTimeout(idx int, maxDuration time.Duration) Err {
-	timeout := false
-	ctx, stopf1 := context.WithTimeout(context.Background(), maxDuration)
+func (kv *ShardKV) waitForCommandWithTimeout(idx int, timeout time.Duration) Err {
+	var isTimeout atomic.Bool
+	ctx, stopf1 := context.WithTimeout(context.Background(), timeout)
 	defer stopf1()
 	stopf := context.AfterFunc(ctx, func() {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
-		timeout = true
+		isTimeout.Store(true)
 		kv.stateUpdateCond.Broadcast()
 	})
 	defer stopf()
 	// wait for applyCh send the exact same message to us
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	for kv.latestAppliedCmdIdx < idx && !kv.dead.Load() && !timeout {
+	for kv.latestAppliedCmdIdx < idx && !kv.dead.Load() && !isTimeout.Load() {
 		kv.stateUpdateCond.Wait()
 	}
 	if kv.dead.Load() {
 		return ErrDead
 	}
-	if timeout {
+	if isTimeout.Load() {
 		return ErrTimeout
 	}
 	return OK
 }
 
+// wait for predictate to be true
 func (kv *ShardKV) waitForCondWithTimeout(predicate func() bool, cond *sync.Cond, timeout time.Duration) Err {
 	var isTimeout atomic.Bool
 	ctx, stopf1 := context.WithTimeout(context.Background(), timeout)
@@ -350,65 +350,107 @@ func (kv *ShardKV) waitForCondWithTimeout(predicate func() bool, cond *sync.Cond
 }
 
 func (kv *ShardKV) goUpdateConfig() {
+	latestConfigNum := -1
+	for !kv.dead.Load() {
+		// optimize so each shard config doesn't need to query -1 to get latest config
+		config, err := kv.queryConfig(-1)
+		if err != OK {
+			kv.dprintf("failed to update config, err %v", err)
+			continue
+		}
+		if config.Num > latestConfigNum {
+			kv.dprintf("found new config %v, trigger shard update config", config.Num)
+			latestConfigNum = config.Num
+			kv.latestConfigNum.Store(int32(latestConfigNum))
+		}
+
+		kv.mu.Lock()
+		for i := 0; i < len(kv.updateConfigRequests); i++ {
+			if kv.configNums[i] < latestConfigNum {
+				// we might falsely trigger update config for shard, if it's migration is ongoing
+				kv.updateConfigRequests[i]++
+			}
+		}
+		kv.triggerUpdateConfigCond.Broadcast()
+		kv.mu.Unlock()
+
+		time.Sleep(time.Millisecond * 100)
+	}
+}
+
+func (kv *ShardKV) goUpdateConfigForShard(shard int) {
 	for !kv.dead.Load() {
 		kv.mu.Lock()
-		for kv.updateConfigRequests == 0 && !kv.dead.Load() {
+		for kv.updateConfigRequests[shard] == 0 && !kv.dead.Load() {
 			kv.triggerUpdateConfigCond.Wait()
 		}
 		if kv.dead.Load() {
 			kv.mu.Unlock()
 			return
 		}
-		kv.updateConfigRequests = 0
 		kv.mu.Unlock()
-
-		kv.updateConfig()
-
-		kv.updateConfigCond.Broadcast()
+		err := kv.updateConfigForShard(shard)
+		if err != OK {
+			kv.dprintf("failed to update config for shard %v, err %v", shard, err)
+			time.Sleep(time.Millisecond * 100) // we don't want it to trigger everytime since this won't reset request
+		} else {
+			kv.dprintf("success to update config for shard %v", shard)
+		}
 	}
 }
 
-func (kv *ShardKV) updateConfig() {
-	config := kv.queryConfig(-1)
-
+func (kv *ShardKV) updateConfigForShard(shard int) Err {
+	kv.dprintf("update config for shard %v start", shard)
 	kv.mu.Lock()
-	currConfig := kv.config
-	ts := time.Now().UnixMilli()
+	currConfigNum := kv.configNums[shard]
 	kv.mu.Unlock()
 
-	nextConfigNum := currConfig.Num + 1
-	if nextConfigNum > config.Num {
+	currConfig, err := kv.queryConfig(currConfigNum)
+	if err != OK {
+		return err
+	}
+
+	config, err := kv.queryConfig(int(kv.latestConfigNum.Load()))
+	if err != OK {
+		return err
+	}
+	ts := time.Now().UnixMilli()
+	kv.dprintf("update config for shard %v, currConfig %v, latest config %v", shard, currConfigNum, config.Num)
+
+	if currConfigNum >= config.Num {
 		// we are already up to date
 		// but we still need to update time so we won't be triggered quickly
-		kv.retryUntilCommit(NewUpdateConfigTimeOp(ts), -1)
-		return
+		err := kv.retryUntilCommit(NewUpdateConfigTimeOp(shard, ts), -1, time.Second*5)
+		if err != OK && err != ErrWrongLeader {
+			kv.dprintf("update config time for shard %v failed, err %v", shard, err)
+			// it's ok to ignore this, and we will be triggered next time
+		}
+		return err
 	}
 
 	// update config 1 by 1, blockingly
-	for ; nextConfigNum <= config.Num; nextConfigNum++ {
-		newConfig := kv.queryConfig(nextConfigNum)
-		err := kv.update1Config(currConfig, newConfig, ts)
+	for ; currConfigNum < config.Num; currConfigNum++ {
+		nextConfigNum := currConfigNum + 1
+		kv.dprintf("try to update config from %v to %v for shard %v", currConfigNum, nextConfigNum, shard)
+		newConfig, err := kv.queryConfig(nextConfigNum)
+		if err != OK {
+			return err
+		}
+		err = kv.update1ConfigForShard(shard, currConfig, newConfig, ts)
 		if err != OK {
 			if err != ErrWrongLeader {
-				kv.dprintf("failed to update config from %v to %v, err %v", currConfig.Num, nextConfigNum, err)
+				kv.dprintf("failed to update config for shard %v from %v to %v, err %v", shard, currConfig.Num, nextConfigNum, err)
 			}
-			// we can safely skip this and wait for another another update config trigger for follower nodes
-			return
+			// we can safely skip this and wait for another update config trigger for follower nodes
+			return err
 		}
+		kv.dprintf("success to update config for shard %v from %v to %v", shard, currConfig.Num, nextConfigNum)
 		currConfig = newConfig
 	}
+	return OK
 }
 
-func (kv *ShardKV) queryConfig(num int) *shardctrler.Config {
-	if num >= 0 {
-		kv.mu.Lock()
-		if kv.configs[num] != nil {
-			kv.mu.Unlock()
-			return kv.configs[num]
-		}
-		kv.mu.Unlock()
-	}
-
+func (kv *ShardKV) queryConfig(num int) (*shardctrler.Config, Err) {
 	args := &shardctrler.QueryArgs{
 		Num: num,
 
@@ -416,29 +458,29 @@ func (kv *ShardKV) queryConfig(num int) *shardctrler.Config {
 		OpId:    kv.opId.Add(1), // this opid can be anything, since the server will always return latest
 	}
 	for {
+		if num >= 0 {
+			kv.mu.Lock()
+			if config := kv.configCache[num]; config.Num == num {
+				kv.mu.Unlock()
+				return &config, OK
+			}
+			kv.mu.Unlock()
+		}
+
 		// try each known server.
 		for _, srv := range kv.ctrlers {
+			if kv.dead.Load() {
+				return nil, ErrDead
+			}
 			var reply shardctrler.QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
 			if ok && reply.Err == OK && reply.WrongLeader == false {
 				kv.mu.Lock()
-				kv.configs[reply.Config.Num] = &reply.Config
+				kv.configCache[reply.Config.Num] = reply.Config
 				kv.mu.Unlock()
-				return &reply.Config
+				return &reply.Config, OK
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// trigger update config periodly, or the config won't update in the leader
-// if the client always reach out to follower
-func (kv *ShardKV) goTriggerUpdateConfig() {
-	for !kv.dead.Load() {
-		kv.mu.Lock()
-		kv.updateConfigRequests++
-		kv.triggerUpdateConfigCond.Signal()
-		kv.mu.Unlock()
 		time.Sleep(100 * time.Millisecond)
 	}
 }

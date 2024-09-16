@@ -18,7 +18,8 @@ import "6.5840/shardctrler"
 import "time"
 
 var (
-	clerkId atomic.Int32
+	clerkId   atomic.Int32
+	opTimeout time.Duration = time.Second * 5
 )
 
 // which shard is a key in?

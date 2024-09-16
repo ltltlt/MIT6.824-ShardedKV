@@ -181,7 +181,6 @@ func (sc *ShardCtrler) applyOpLocked(op *Op) {
 		newConfig.Shards[op.Shard] = op.GID
 		sc.configs = append(sc.configs, newConfig)
 		sc.dprintf("apply move op, shard %v from %v to %v", op.Shard, oldGID, op.GID)
-	default:
 	}
 }
 

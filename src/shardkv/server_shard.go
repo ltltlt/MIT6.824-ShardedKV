@@ -9,7 +9,7 @@ import (
 // all replica will do the movement, and destination server should be able to dedup by configNum
 // need to make sure PutShardData is serial because they share same clerkid, if 2 op happen in the same time
 // with OpId 1 and OpId 2, if destination receive 2 before 1, 1 will be ignored
-func (kv *ShardKV) moveShard(configNum int, shard int, data map[string]string, servers []string, moveShardOpId int32, maxOpIdForClerk map[int32]int32) {
+func (kv *ShardKV) moveShard(configNum int, shard int, data map[string]string, servers []string, maxOpIdForClerk map[int32]int32) {
 	// wait for shard to be ready
 	req := &PutShardDataArgs{
 		Shard:           shard,
@@ -17,11 +17,12 @@ func (kv *ShardKV) moveShard(configNum int, shard int, data map[string]string, s
 		ConfigNum:       configNum,
 		MaxOpIdForClerk: maxOpIdForClerk,
 
-		ClerkId: int32(kv.gid), // this group act as a unit to move shard
-		OpId:    moveShardOpId,
+		ClerkId: kv.clerkId,
+		OpId:    kv.opId.Add(1),
 	}
 	for {
 		for _, server := range servers {
+			kv.dprintf("try to move shard %v from me to %v", shard, server)
 			end := kv.make_end(server)
 			var reply PutShardDataReply
 			if ok := end.Call("ShardKV.PutShardData", req, &reply); ok {
@@ -38,36 +39,49 @@ func (kv *ShardKV) moveShard(configNum int, shard int, data map[string]string, s
 	}
 }
 
-func (kv *ShardKV) shardMatch(shard int) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	return kv.shardMatchLocked(shard)
-}
-
-func (kv *ShardKV) shardMatchLocked(shard int) bool {
-	for time.Now().UnixMilli()-kv.updateConfigTime > 100 {
-		kv.updateConfigRequests++
-		kv.triggerUpdateConfigCond.Signal()
-		kv.updateConfigCond.Wait()
+func (kv *ShardKV) shardMatchLocked(shard int, timeout time.Duration) Err {
+	if !kv.isConfigUpToDateLocked(shard) {
+		if err := kv.waitConfigUpdate(shard, timeout); err != OK {
+			return err
+		}
 	}
+	kv.dprintf("config for shard %v is up to date", shard)
 
-	kv.waitShardPutLocked(shard)
+	if err := kv.waitShardPutLocked(shard, timeout); err != OK {
+		return err
+	}
 	if kv.shards[shard] != kv.gid {
 		kv.dprintf("shard %v is not owned by me, but owned by %v", shard, kv.shards[shard])
-		return false
+		return ErrWrongGroup
 	}
-	return true
+	return OK
 }
 
-func (kv *ShardKV) waitShardPutLocked(shard int) {
-	rnd := rand.Int()
-	waitForMigration := false
-	for !kv.dead.Load() && kv.shards[shard] == ShardWaitForPut {
-		kv.dprintf("%v shard %v is in migration and is not available, wait...", rnd, shard)
-		waitForMigration = true
-		kv.moveShardCond.Wait()
+func (kv *ShardKV) waitConfigUpdate(shard int, timeout time.Duration) Err {
+	kv.dprintf("config for shard %v is out of date, wait until update", shard)
+	kv.updateConfigRequests[shard]++
+	kv.triggerUpdateConfigCond.Broadcast()
+
+	return kv.waitForCondWithTimeout(func() bool {
+		return kv.isConfigUpToDateLocked(shard)
+	}, kv.updateConfigDoneCond, timeout)
+}
+
+func (kv *ShardKV) isConfigUpToDateLocked(shard int) bool {
+	return time.Now().UnixMilli()-kv.updateConfigTimes[shard] <= 100
+}
+
+func (kv *ShardKV) waitShardPutLocked(shard int, timeout time.Duration) Err {
+	if kv.shards[shard] != ShardWaitForPut {
+		return OK
 	}
-	if !kv.dead.Load() && waitForMigration {
+	rnd := rand.Int()
+	kv.dprintf("%v shard %v is in migration and is not available, wait...", rnd, shard)
+	err := kv.waitForCondWithTimeout(func() bool {
+		return kv.shards[shard] != ShardWaitForPut
+	}, kv.shardStateUpdateCond, timeout)
+	if err == OK {
 		kv.dprintf("%v shard %v migration is done", rnd, shard)
 	}
+	return err
 }
