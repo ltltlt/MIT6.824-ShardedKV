@@ -35,11 +35,11 @@ type ShardKV struct {
 	clerkId int32
 	opId    atomic.Int32
 
-	updateConfigTimes       [shardctrler.NShards]int64
 	updateConfigDoneCond    *sync.Cond
 	triggerUpdateConfigCond *sync.Cond
 	updateConfigRequests    [shardctrler.NShards]int
 
+	updateConfigTimes  [shardctrler.NShards]int64
 	configNums         [shardctrler.NShards]int // each shard maintain it's own configNum
 	shards             [shardctrler.NShards]int // shard => server or shardData
 	putShardConfigNums [shardctrler.NShards]int
@@ -71,10 +71,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 }
 
-func (kv *ShardKV) PutShardData(args *PutShardDataArgs, reply *PutShardDataReply) {
-	reply.Err = kv.retryUntilCommit(NewPutShardOp(args), -1, opTimeout)
-}
-
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	shard := key2shard(args.Key)
 	var op *Op
@@ -84,6 +80,18 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		op = NewAppendOp(args, shard)
 	}
 	reply.Err = kv.retryUntilCommit(op, shard, opTimeout)
+}
+
+func (kv *ShardKV) PutShardData(args *PutShardDataArgs, reply *PutShardDataReply) {
+	// avoid always add log entries causes it too large
+	kv.mu.Lock()
+	if kv.putShardConfigNums[args.Shard] >= args.ConfigNum {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	reply.Err = kv.retryUntilCommit(NewPutShardOp(args), -1, opTimeout)
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -133,6 +141,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(PutShardOpData{})
 	labgob.Register(UpdateKeyOpData{})
 	labgob.Register(UpdateConfigOpData{})
+	labgob.Register(UpdateConfigTimeOpData{})
 
 	kv := new(ShardKV)
 	kv.me = me

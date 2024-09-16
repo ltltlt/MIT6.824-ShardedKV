@@ -47,7 +47,6 @@ func NewGetOp(args *GetArgs, shard int) *Op {
 		ClerkId: args.ClerkId,
 		OpId:    args.OpId,
 
-		Shard: shard, // used for debug
 		Data: UpdateKeyOpData{
 			Key: args.Key,
 		},
@@ -60,7 +59,6 @@ func NewPutOp(args *PutAppendArgs, shard int) *Op {
 		ClerkId: args.ClerkId,
 		OpId:    args.OpId,
 
-		Shard: shard,
 		Data: UpdateKeyOpData{
 			Key:   args.Key,
 			Value: args.Value,
@@ -74,7 +72,6 @@ func NewAppendOp(args *PutAppendArgs, shard int) *Op {
 		ClerkId: args.ClerkId,
 		OpId:    args.OpId,
 
-		Shard: shard,
 		Data: UpdateKeyOpData{
 			Key:   args.Key,
 			Value: args.Value,

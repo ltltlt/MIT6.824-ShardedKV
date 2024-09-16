@@ -120,7 +120,7 @@ func (kv *ShardKV) applyOpLocked(op *Op) Err {
 		return kv.applyDataOpLocked(op)
 	}
 
-	kv.dprintf("apply op %+v", op)
+	kv.dprintf("apply op %v", op.OpType)
 
 	switch op.OpType {
 	case OpPutShard:
@@ -154,6 +154,7 @@ func (kv *ShardKV) applyOpLocked(op *Op) Err {
 		// config is updated successfully, do the gabage collection
 		if kv.shards[op.Shard] != kv.gid && kv.putShardConfigNums[op.Shard] < detail.NewConfigNum {
 			kv.shardData[op.Shard] = nil
+			kv.maxOpIdForClerks[op.Shard] = nil
 		}
 		// since we update the config, reset the request
 		kv.updateConfigRequests[op.Shard] = 0
@@ -181,12 +182,11 @@ func (kv *ShardKV) update1ConfigForShard(shard int, oldConfig *shardctrler.Confi
 				kv.dprintf("update config from %v to %v blocking, wait for putShard for %v", oldConfig.Num, newConfig.Num, shard)
 				kv.shards[shard] = ShardWaitForPut
 				kv.waitShardPutLocked(shard, time.Minute*60) // it's ok for us to block forever
-				kv.mu.Unlock()
 			} else {
 				// the shard is already put to me, so I don't have to wait
 				kv.shards[shard] = gid
-				kv.mu.Unlock()
 			}
+			kv.mu.Unlock()
 		}
 	} else {
 		// me => not me
@@ -207,13 +207,25 @@ func (kv *ShardKV) update1ConfigForShard(shard int, oldConfig *shardctrler.Confi
 		}
 
 		kv.mu.Lock()
-		data := shardctrler.CopyMap(kv.shardData[shard]) // after freeze, the data might be modified by read snapshot
+		// after freeze, the data might be modified by read snapshot
+		// and before move shard complete, we cannot erase the data directly
+		data := shardctrler.CopyMap(kv.shardData[shard])
 		maxOpIdForClerk := shardctrler.CopyMap(kv.maxOpIdForClerks[shard])
 		kv.mu.Unlock()
 
-		kv.moveShard(newConfig.Num, shard, data, servers, maxOpIdForClerk)
+		if err := kv.putShardToServer(newConfig.Num, shard, data, servers, maxOpIdForClerk); err == OK {
+			kv.mu.Lock()
+			if kv.putShardConfigNums[shard] < newConfig.Num {
+				// no one put shards back to us, we can clean the shard early
+				// though we might not commit the change, and after restart, we try to put shard again with
+				// nil, the destination should already commit put shard, so the nil will be ignored
+				kv.shardData[shard] = nil
+				kv.maxOpIdForClerks[shard] = nil
+			}
+			kv.mu.Unlock()
+		}
 	}
-	kv.dprintf("success to move shard %v from %v (%v) => %v (%v), now commit the config change for the shard",
+	kv.dprintf("success to update config for shard %v from %v (%v) => %v (%v), now commit the config change for the shard",
 		shard, oldConfig.Num, oldGID, newConfig.Num, gid)
 	// the shard movement is done, now we commit the change
 	// it's ok if we failed to commit before crash, we will do this again without any issue

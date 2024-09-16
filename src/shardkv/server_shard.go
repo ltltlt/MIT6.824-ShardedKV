@@ -5,11 +5,12 @@ import (
 	"time"
 )
 
-// moveShard move shard from me to servers
+// putShardToServer move shard from me to servers
 // all replica will do the movement, and destination server should be able to dedup by configNum
 // need to make sure PutShardData is serial because they share same clerkid, if 2 op happen in the same time
 // with OpId 1 and OpId 2, if destination receive 2 before 1, 1 will be ignored
-func (kv *ShardKV) moveShard(configNum int, shard int, data map[string]string, servers []string, maxOpIdForClerk map[int32]int32) {
+func (kv *ShardKV) putShardToServer(configNum int, shard int, data map[string]string,
+	servers []string, maxOpIdForClerk map[int32]int32) Err {
 	// wait for shard to be ready
 	req := &PutShardDataArgs{
 		Shard:           shard,
@@ -28,7 +29,7 @@ func (kv *ShardKV) moveShard(configNum int, shard int, data map[string]string, s
 			if ok := end.Call("ShardKV.PutShardData", req, &reply); ok {
 				if reply.Err == OK {
 					kv.dprintf("success to move shard %v, %v from me to %v", shard, data, server)
-					return
+					return OK
 				}
 				if reply.Err != ErrWrongLeader {
 					kv.dprintf("failed to move shard %v from me to %v, err %v", shard, server, reply.Err)
