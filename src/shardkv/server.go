@@ -20,9 +20,9 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	persister           *raft.Persister
-	shardData           [shardctrler.NShards]map[string]string
 	stateUpdateCond     *sync.Cond
 	latestAppliedCmdIdx int
+	shardData           [shardctrler.NShards]map[string]string
 	maxOpIdForClerks    [shardctrler.NShards]map[int32]int32 // used to avoid re-executing op
 
 	// we don't have to keep below in stable storage
@@ -37,11 +37,9 @@ type ShardKV struct {
 
 	updateConfigDoneCond    *sync.Cond
 	triggerUpdateConfigCond *sync.Cond
-	updateConfigRequests    [shardctrler.NShards]int
 
-	updateConfigTimes  [shardctrler.NShards]int64
 	configNums         [shardctrler.NShards]int // each shard maintain it's own configNum
-	shards             [shardctrler.NShards]int // shard => server or shardData
+	shards             [shardctrler.NShards]int // shard => server or state
 	putShardConfigNums [shardctrler.NShards]int
 
 	configCache          map[int]shardctrler.Config // cache so we don't have to query every time
@@ -141,7 +139,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(PutShardOpData{})
 	labgob.Register(UpdateKeyOpData{})
 	labgob.Register(UpdateConfigOpData{})
-	labgob.Register(UpdateConfigTimeOpData{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -179,10 +176,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.configCache = make(map[int]shardctrler.Config)
 
 	kv.clerkId = int32(kv.gid)*100 + int32(kv.me)
-
-	for i := 0; i < len(kv.updateConfigRequests); i++ {
-		kv.updateConfigRequests[i]++ // trigger on starting to pull latest config
-	}
 
 	kv.dprintf("start server")
 	kv.shardStateUpdateCond = sync.NewCond(&kv.mu)

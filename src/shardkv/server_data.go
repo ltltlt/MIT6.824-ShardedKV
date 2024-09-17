@@ -34,11 +34,6 @@ type UpdateKeyOpData struct {
 type UpdateConfigOpData struct {
 	NewConfigNum int
 	NewGID       int
-	UpdateConfigTimeOpData
-}
-
-type UpdateConfigTimeOpData struct {
-	Timestamp int64
 }
 
 func NewGetOp(args *GetArgs, shard int) *Op {
@@ -106,11 +101,10 @@ func NewUpdateShardStateOp(shard int, newGID int, clerkId int32, opId int32) *Op
 	}
 }
 
-func NewUpdateConfigOp(shard int, newConfigNum int, newShard int, ts int64, clerkId int32, opId int32) *Op {
+func NewUpdateConfigOp(shard int, newConfigNum int, newShard int, clerkId int32, opId int32) *Op {
 	detail := UpdateConfigOpData{
-		NewConfigNum:           newConfigNum,
-		NewGID:                 newShard,
-		UpdateConfigTimeOpData: UpdateConfigTimeOpData{Timestamp: ts},
+		NewConfigNum: newConfigNum,
+		NewGID:       newShard,
 	}
 
 	return &Op{
@@ -120,13 +114,5 @@ func NewUpdateConfigOp(shard int, newConfigNum int, newShard int, ts int64, cler
 		Data:    detail,
 		ClerkId: clerkId,
 		OpId:    opId,
-	}
-}
-
-func NewUpdateConfigTimeOp(shard int, ts int64) *Op {
-	return &Op{
-		Shard:  shard,
-		OpType: OpUpdateConfigTime,
-		Data:   UpdateConfigTimeOpData{Timestamp: ts},
 	}
 }

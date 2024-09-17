@@ -28,7 +28,7 @@ func (kv *ShardKV) putShardToServer(configNum int, shard int, data map[string]st
 			var reply PutShardDataReply
 			if ok := end.Call("ShardKV.PutShardData", req, &reply); ok {
 				if reply.Err == OK {
-					kv.dprintf("success to move shard %v, %v from me to %v", shard, data, server)
+					kv.dprintf("success to move shard %v from me to %v", shard, server)
 					return OK
 				}
 				if reply.Err != ErrWrongLeader {
@@ -60,7 +60,6 @@ func (kv *ShardKV) shardMatchLocked(shard int, timeout time.Duration) Err {
 
 func (kv *ShardKV) waitConfigUpdate(shard int, timeout time.Duration) Err {
 	kv.dprintf("config for shard %v is out of date, wait until update", shard)
-	kv.updateConfigRequests[shard]++
 	kv.triggerUpdateConfigCond.Broadcast()
 
 	return kv.waitForCondWithTimeout(func() bool {
@@ -69,7 +68,7 @@ func (kv *ShardKV) waitConfigUpdate(shard int, timeout time.Duration) Err {
 }
 
 func (kv *ShardKV) isConfigUpToDateLocked(shard int) bool {
-	return time.Now().UnixMilli()-kv.updateConfigTimes[shard] <= 100
+	return kv.configNums[shard] == int(kv.latestConfigNum.Load())
 }
 
 func (kv *ShardKV) waitShardPutLocked(shard int, timeout time.Duration) Err {

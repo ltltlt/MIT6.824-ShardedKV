@@ -18,7 +18,6 @@ const (
 	OpUpdateShardState
 
 	OpUpdateConfig = iota + 20
-	OpUpdateConfigTime
 )
 
 const (
@@ -141,15 +140,9 @@ func (kv *ShardKV) applyOpLocked(op *Op) Err {
 		detail := op.Data.(UpdateShardStateOpData)
 		kv.shards[op.Shard] = detail.GID
 		kv.shardStateUpdateCond.Broadcast()
-	case OpUpdateConfigTime:
-		detail := op.Data.(UpdateConfigTimeOpData)
-		kv.updateConfigTimes[op.Shard] = detail.Timestamp
-		kv.updateConfigRequests[op.Shard] = 0
-		kv.updateConfigDoneCond.Broadcast()
 	case OpUpdateConfig:
 		detail := op.Data.(UpdateConfigOpData)
 		kv.configNums[op.Shard] = detail.NewConfigNum
-		kv.updateConfigTimes[op.Shard] = detail.Timestamp
 		kv.shards[op.Shard] = detail.NewGID
 		// config is updated successfully, do the gabage collection
 		if kv.shards[op.Shard] != kv.gid && kv.putShardConfigNums[op.Shard] < detail.NewConfigNum {
@@ -157,13 +150,12 @@ func (kv *ShardKV) applyOpLocked(op *Op) Err {
 			kv.maxOpIdForClerks[op.Shard] = nil
 		}
 		// since we update the config, reset the request
-		kv.updateConfigRequests[op.Shard] = 0
 		kv.updateConfigDoneCond.Broadcast()
 	}
 	return OK
 }
 
-func (kv *ShardKV) update1ConfigForShard(shard int, oldConfig *shardctrler.Config, newConfig *shardctrler.Config, ts int64) Err {
+func (kv *ShardKV) update1ConfigForShard(shard int, oldConfig *shardctrler.Config, newConfig *shardctrler.Config) Err {
 	gid := newConfig.Shards[shard]
 	oldGID := oldConfig.Shards[shard]
 	kv.dprintf("try to update config for shard %v from %v (%v) => %v (%v)",
@@ -229,7 +221,7 @@ func (kv *ShardKV) update1ConfigForShard(shard int, oldConfig *shardctrler.Confi
 		shard, oldConfig.Num, oldGID, newConfig.Num, gid)
 	// the shard movement is done, now we commit the change
 	// it's ok if we failed to commit before crash, we will do this again without any issue
-	op := NewUpdateConfigOp(shard, newConfig.Num, gid, ts, kv.clerkId, kv.opId.Add(1))
+	op := NewUpdateConfigOp(shard, newConfig.Num, gid, kv.clerkId, kv.opId.Add(1))
 	err := kv.retryUntilCommit(op, -1, time.Second*5) // we can block here forever, instead of start another one
 	if err != OK && err != ErrWrongLeader {
 		kv.dprintf("failed to update config for shard %v after shard movement, err %v", shard, err)
@@ -376,16 +368,7 @@ func (kv *ShardKV) goUpdateConfig() {
 			kv.latestConfigNum.Store(int32(latestConfigNum))
 		}
 
-		kv.mu.Lock()
-		for i := 0; i < len(kv.updateConfigRequests); i++ {
-			if kv.configNums[i] < latestConfigNum {
-				// we might falsely trigger update config for shard, if it's migration is ongoing
-				kv.updateConfigRequests[i]++
-			}
-		}
 		kv.triggerUpdateConfigCond.Broadcast()
-		kv.mu.Unlock()
-
 		time.Sleep(time.Millisecond * 100)
 	}
 }
@@ -393,7 +376,7 @@ func (kv *ShardKV) goUpdateConfig() {
 func (kv *ShardKV) goUpdateConfigForShard(shard int) {
 	for !kv.dead.Load() {
 		kv.mu.Lock()
-		for kv.updateConfigRequests[shard] == 0 && !kv.dead.Load() {
+		for kv.isConfigUpToDateLocked(shard) && !kv.dead.Load() {
 			kv.triggerUpdateConfigCond.Wait()
 		}
 		if kv.dead.Load() {
@@ -426,18 +409,11 @@ func (kv *ShardKV) updateConfigForShard(shard int) Err {
 	if err != OK {
 		return err
 	}
-	ts := time.Now().UnixMilli()
 	kv.dprintf("update config for shard %v, currConfig %v, latest config %v", shard, currConfigNum, config.Num)
 
 	if currConfigNum >= config.Num {
 		// we are already up to date
-		// but we still need to update time so we won't be triggered quickly
-		err := kv.retryUntilCommit(NewUpdateConfigTimeOp(shard, ts), -1, time.Second*5)
-		if err != OK && err != ErrWrongLeader {
-			kv.dprintf("update config time for shard %v failed, err %v", shard, err)
-			// it's ok to ignore this, and we will be triggered next time
-		}
-		return err
+		return OK
 	}
 
 	// update config 1 by 1, blockingly
@@ -448,7 +424,7 @@ func (kv *ShardKV) updateConfigForShard(shard int) Err {
 		if err != OK {
 			return err
 		}
-		err = kv.update1ConfigForShard(shard, currConfig, newConfig, ts)
+		err = kv.update1ConfigForShard(shard, currConfig, newConfig)
 		if err != OK {
 			if err != ErrWrongLeader {
 				kv.dprintf("failed to update config for shard %v from %v to %v, err %v", shard, currConfig.Num, nextConfigNum, err)
